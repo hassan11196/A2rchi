@@ -238,6 +238,7 @@ class CERNSSOScraper:
             
         # Create output directory if it doesn't exist
         os.makedirs(output_dir, exist_ok=True)
+        print(f"Saving crawled data to {output_dir}...")
         
         # Save a summary file with all URLs and titles
         summary_path = os.path.join(output_dir, "summary.txt")
@@ -260,7 +261,7 @@ class CERNSSOScraper:
                 f.write(f"URL: {page['url']}\n")
                 f.write(f"Title: {page['title']}\n")
                 f.write("="*80 + "\n\n")
-                f.write(page.get('html', page.get('page_source', '')))
+                f.write(page.get('content', page.get('html', '')))
             
             # # Also save a text file for basic reading/searching
             # text_file_path = os.path.join(output_dir, f"{i+1}_{safe_name}.txt")
