@@ -3,6 +3,7 @@ import time
 import re
 import json
 import urllib.parse
+from abc import ABC, abstractmethod
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.firefox.options import Options as FirefoxOptions
@@ -10,29 +11,43 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 
-# TODO: Refacto this to use a more generic SSO scraper base class
-#       and create specific subclasses for CERN SSO, etc.
-class CERNSSOScraper:
-    """A scraper to handle CERN SSO authentication and page navigation."""
+class SSOScraper(ABC):
+    """Generic base class for SSO-authenticated web scrapers."""
     
     def __init__(self, username=None, password=None, headless=True, site_type="generic"):
-        """Initialize the CERN SSO scraper with credentials and browser settings.
+        """Initialize the SSO scraper with credentials and browser settings.
         
         Args:
-            username (str, optional): CERN SSO username. If None, will try to get from env vars.
-            password (str, optional): CERN SSO password. If None, will try to get from env vars.
+            username (str, optional): SSO username. If None, will try to get from env vars.
+            password (str, optional): SSO password. If None, will try to get from env vars.
             headless (bool): Whether to run the browser in headless mode.
             site_type (str): Type of site to scrape ('generic' or 'mkdocs')
         """
-        # Set credentials
-        self.username = username or os.getenv("CERN_SSO_SCRAPER_USERNAME")
-        print(f"Using username: {self.username}")
-        self.password = password or os.getenv("CERN_SSO_SCRAPER_PASSWORD")
+        self.username = username or self.get_username_from_env()
+        self.password = password or self.get_password_from_env()
         self.headless = headless
         self.site_type = site_type
         self.driver = None
         self.visited_urls = set()
         self.page_data = []
+        
+        if self.username:
+            print(f"Using username: {self.username}")
+    
+    @abstractmethod
+    def get_username_from_env(self):
+        """Get username from environment variables. Override in subclasses."""
+        pass
+    
+    @abstractmethod
+    def get_password_from_env(self):
+        """Get password from environment variables. Override in subclasses."""
+        pass
+    
+    @abstractmethod
+    def login(self):
+        """Login to SSO with the provided credentials. Override in subclasses."""
+        pass
     
     def setup_driver(self):
         """Configure and initialize the Firefox WebDriver."""
@@ -58,32 +73,6 @@ class CERNSSOScraper:
         self.driver.set_page_load_timeout(30)
         print(f"Starting Firefox browser in {'headless' if self.headless else 'visible'} mode...")
         return self.driver
-    
-    def login(self):
-        """Login to CERN SSO with the provided credentials."""
-        if not self.username or not self.password:
-            raise ValueError("Missing credentials for CERN SSO")
-            
-        try:
-            # Wait for login form to appear
-            username_input = WebDriverWait(self.driver, 10).until(
-                EC.presence_of_element_located((By.ID, "username"))
-            )
-            username_input.send_keys(self.username)
-            # time.sleep(1)  # Optional sleep to ensure the input is registered
-            
-            password_input = self.driver.find_element(By.ID, "password")
-            password_input.send_keys(self.password)
-            # time.sleep(1)  # Optional sleep to ensure the input is registered
-            
-            sign_in = self.driver.find_element(By.ID, "kc-login")
-            sign_in.click()
-                
-            print("Login credentials submitted")
-            return True
-        except Exception as e:
-            print(f"Error during login: {e}")
-            return False
     
     def navigate_to(self, url, wait_time=1):
         """Navigate to specified URL and wait for page to load."""
@@ -335,3 +324,42 @@ class CERNSSOScraper:
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit point."""
         self.close()
+
+
+class CERNSSOScraper(SSOScraper):
+    """A scraper to handle CERN SSO authentication and page navigation."""
+    
+    def get_username_from_env(self):
+        """Get CERN SSO username from environment variables."""
+        return os.getenv("CERN_SSO_SCRAPER_USERNAME")
+    
+    def get_password_from_env(self):
+        """Get CERN SSO password from environment variables."""
+        return os.getenv("CERN_SSO_SCRAPER_PASSWORD")
+    
+    def login(self):
+        """Login to CERN SSO with the provided credentials."""
+        if not self.username or not self.password:
+            raise ValueError("Missing credentials for CERN SSO")
+            
+        try:
+            # Wait for login form to appear
+            username_input = WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.ID, "username"))
+            )
+            username_input.send_keys(self.username)
+            # time.sleep(1)  # Optional sleep to ensure the input is registered
+            
+            password_input = self.driver.find_element(By.ID, "password")
+            password_input.send_keys(self.password)
+            # time.sleep(1)  # Optional sleep to ensure the input is registered
+            
+            sign_in = self.driver.find_element(By.ID, "kc-login")
+            sign_in.click()
+                
+            print("Login credentials submitted")
+            return True
+        except Exception as e:
+            print(f"Error during login: {e}")
+            return False
+
