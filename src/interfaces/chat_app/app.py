@@ -2231,7 +2231,22 @@ class ChatWrapper:
                 pipeline_name=self.archi.pipeline_name if hasattr(self.archi, 'pipeline_name') else None,
             )
 
-            for output in self.archi.stream(history=context.history, conversation_id=context.conversation_id, user_id=user_id, model=context.model_used):
+            # MCP tool-approval events fire from inside the tool-execution
+            # thread (which is the same thread as this stream loop, since
+            # archi.stream() is synchronous).  We accumulate them in a list
+            # and drain the list after each agent yield so they reach the
+            # client interleaved with the agent's regular output.
+            pending_approval_events: List[Dict[str, Any]] = []
+
+            def _approval_notifier(payload: Dict[str, Any]) -> None:
+                pending_approval_events.append({
+                    "type": "tool_approval_request",
+                    **payload,
+                })
+
+            for output in self.archi.stream(history=context.history, conversation_id=context.conversation_id, user_id=user_id, model=context.model_used, approval_notifier=_approval_notifier):
+                while pending_approval_events:
+                    yield pending_approval_events.pop(0)
                 if client_timeout and time.time() - stream_start_time > client_timeout:
                     if trace_id:
                         total_duration_ms = int((time.time() - stream_start_time) * 1000)

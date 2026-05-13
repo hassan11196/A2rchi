@@ -1094,10 +1094,91 @@ def get_api_info():
     }), 200
 
 
+# ---------------------------------------------------------------------------
+# MCP tool approvals (Claude-style write/execute gate)
+# ---------------------------------------------------------------------------
+
+@api.route('/tool-approvals/<approval_id>', methods=['GET'])
+def get_tool_approval(approval_id: str):
+    """Return the current state of a pending/decided tool-approval row."""
+    try:
+        services = get_services()
+        approval = services.tool_approval_service.get(approval_id)
+        if approval is None:
+            return jsonify({'error': 'not_found'}), 404
+        return jsonify(_serialize_approval(approval)), 200
+    except Exception as exc:
+        logger.error("Error reading tool approval %s: %s", approval_id, exc)
+        return jsonify({'error': str(exc)}), 500
+
+
+@api.route('/tool-approvals/<approval_id>', methods=['POST'])
+def decide_tool_approval(approval_id: str):
+    """Approve or deny a pending tool call.
+
+    Body: ``{"decision": "approve"|"deny"}``
+
+    Returns the updated row.  Rejects decisions on already-terminal or
+    expired approvals.
+    """
+    body = request.get_json(silent=True) or {}
+    raw = (body.get('decision') or '').strip().lower()
+    mapping = {'approve': 'approved', 'approved': 'approved',
+               'deny': 'denied', 'denied': 'denied'}
+    decision = mapping.get(raw)
+    if not decision:
+        return jsonify({
+            'error': 'invalid_decision',
+            'detail': "decision must be 'approve' or 'deny'",
+        }), 400
+
+    decided_by = (
+        (session.get('user') or {}).get('user_id')
+        or g.get('client_id')
+        or 'anonymous'
+    )
+    try:
+        services = get_services()
+        updated = services.tool_approval_service.decide(
+            approval_id,
+            decision=decision,
+            decided_by=decided_by,
+        )
+        if updated is None:
+            return jsonify({
+                'error': 'not_pending',
+                'detail': 'Approval is missing, already decided, or expired.',
+            }), 409
+        return jsonify(_serialize_approval(updated)), 200
+    except Exception as exc:
+        logger.error("Error deciding tool approval %s: %s", approval_id, exc)
+        return jsonify({'error': str(exc)}), 500
+
+
+def _serialize_approval(approval) -> dict:
+    return {
+        'approval_id': approval.approval_id,
+        'conversation_id': approval.conversation_id,
+        'message_id': approval.message_id,
+        'user_id': approval.user_id,
+        'server_name': approval.server_name,
+        'tool_name': approval.tool_name,
+        'tool_args': approval.tool_args,
+        'args_hash': approval.args_hash,
+        'sensitivity': approval.sensitivity,
+        'status': approval.status,
+        'requested_at': approval.requested_at.isoformat() if approval.requested_at else None,
+        'decided_at': approval.decided_at.isoformat() if approval.decided_at else None,
+        'decided_by': approval.decided_by,
+        'expires_at': approval.expires_at.isoformat() if approval.expires_at else None,
+        'source': approval.source,
+    }
+
+
 def register_api(app):
     """
     Register the API blueprint with a Flask app.
-    
+
     Usage:
         from src.interfaces.chat_app.api import register_api
         register_api(app)
