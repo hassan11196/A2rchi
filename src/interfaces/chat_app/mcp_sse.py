@@ -58,6 +58,7 @@ import queue
 import re
 import shlex
 import textwrap
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -101,6 +102,63 @@ _dispatch_slots = BoundedSemaphore(_MCP_DISPATCH_MAX_INFLIGHT)
 # ---------------------------------------------------------------------------
 
 
+# Coalescer for `mcp_tokens.last_used_at` writes.  A high-frequency MCP client
+# (Claude Desktop, Cursor) can issue several requests per second; writing on
+# every read serialises Flask request handling on a single-row PostgreSQL
+# commit and produces a sustained write storm.  Instead, we record the latest
+# observation in-process and flush it lazily — either once per token+window or
+# once a buffered batch is large enough.
+_MCP_TOKEN_LAST_USED_FLUSH_INTERVAL = 60.0     # seconds between flushes per token
+_MCP_TOKEN_LAST_USED_FLUSH_BATCH = 32          # flush sooner when this many distinct tokens are pending
+_mcp_token_last_used_pending: Dict[str, float] = {}
+_mcp_token_last_used_seen: Dict[str, float] = {}
+_mcp_token_last_used_lock = Lock()
+
+
+def _flush_mcp_token_last_used(pg_config: Optional[dict]) -> None:
+    """Persist any buffered last_used_at observations to ``mcp_tokens``."""
+    if not pg_config:
+        return
+    with _mcp_token_last_used_lock:
+        if not _mcp_token_last_used_pending:
+            return
+        rows = list(_mcp_token_last_used_pending.items())
+        _mcp_token_last_used_pending.clear()
+    try:
+        conn = psycopg2.connect(**pg_config)
+        try:
+            with conn.cursor() as cur:
+                # Single statement per token avoids holding the row lock long.
+                for token, _ in rows:
+                    cur.execute(
+                        "UPDATE mcp_tokens SET last_used_at = NOW() WHERE token = %s",
+                        (token,),
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        logger.exception("Error flushing mcp_tokens.last_used_at batch")
+
+
+def _note_mcp_token_used(token: str, pg_config: Optional[dict]) -> None:
+    """Record an observation of *token* and flush opportunistically."""
+    now = time.monotonic()
+    with _mcp_token_last_used_lock:
+        _mcp_token_last_used_pending[token] = now
+        last_seen = _mcp_token_last_used_seen.get(token, 0.0)
+        # Flush this token if its own window has rolled over, OR if the buffer
+        # has grown beyond the batch threshold.
+        should_flush = (
+            now - last_seen >= _MCP_TOKEN_LAST_USED_FLUSH_INTERVAL
+            or len(_mcp_token_last_used_pending) >= _MCP_TOKEN_LAST_USED_FLUSH_BATCH
+        )
+        if should_flush:
+            _mcp_token_last_used_seen[token] = now
+    if should_flush:
+        _flush_mcp_token_last_used(pg_config)
+
+
 def _validate_mcp_token(token: str, pg_config: Optional[dict]) -> Optional[str]:
     """Validate an MCP bearer token and return the user_id, or None if invalid."""
     if not token or not pg_config:
@@ -117,16 +175,16 @@ def _validate_mcp_token(token: str, pg_config: Optional[dict]) -> Optional[str]:
                 )
                 row = cur.fetchone()
                 if row:
-                    cur.execute(
-                        "UPDATE mcp_tokens SET last_used_at = NOW() WHERE token = %s",
-                        (token,),
-                    )
-                    conn.commit()
-                    return row[0]
+                    user_id = row[0]
         finally:
             conn.close()
     except Exception:
         logger.exception("Error validating MCP token")
+        return None
+    else:
+        if row:
+            _note_mcp_token_used(token, pg_config)
+            return user_id
     return None
 
 
@@ -182,8 +240,14 @@ _TOOLS = [
                 },
                 "client_timeout": {
                     "type": "number",
-                    "description": "Optional. Request timeout in milliseconds (default 18000000 = 5 hours).",
-                    "default": 18000000,
+                    "description": (
+                        "Optional. Request timeout in milliseconds. Defaults to "
+                        "services.chat_app.client_timeout_seconds (typically 30 s); "
+                        "values above 300000 ms (5 min) are clamped server-side."
+                    ),
+                    "default": 30000,
+                    "minimum": 1000,
+                    "maximum": 300000,
                 },
             },
             "required": ["question"],
@@ -744,12 +808,22 @@ def _tool_query(
         default_timeout_ms = int(float(chat_cfg.get("client_timeout_seconds", 30)) * 1000)
     except Exception:
         pass
-    # client_timeout is in milliseconds (matching UI convention); convert to seconds
+    # client_timeout is in milliseconds (matching UI convention); convert to seconds.
+    # Clamp to a 5-minute ceiling so a misbehaving client can't tie up a dispatch
+    # slot + DB connection indefinitely.
+    _CLIENT_TIMEOUT_MAX_SECONDS = 300.0
     client_timeout_ms = arguments.get("client_timeout", default_timeout_ms)
     try:
         client_timeout = max(float(client_timeout_ms) / 1000.0, 1.0)
     except (TypeError, ValueError):
         client_timeout = max(float(default_timeout_ms) / 1000.0, 1.0)
+    if client_timeout > _CLIENT_TIMEOUT_MAX_SECONDS:
+        logger.info(
+            "Clamping archi_query client_timeout from %.0fs to %.0fs",
+            client_timeout,
+            _CLIENT_TIMEOUT_MAX_SECONDS,
+        )
+        client_timeout = _CLIENT_TIMEOUT_MAX_SECONDS
     client_id = f"mcp-sse-{uuid.uuid4().hex[:12]}"
     now = datetime.now(timezone.utc)
 

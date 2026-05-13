@@ -54,7 +54,16 @@ class BaseReActAgent:
             self.selected_tool_names = list(getattr(agent_spec, "tools", []) or [])
         self._active_memory: Optional[RunMemory] = None
         self._static_tools: Optional[List[Callable]] = None
-        self._mcp_tools: Optional[List[Callable]] = None
+        # Per-user MCP-tool cache keyed by user_id (None = anonymous). The
+        # entry is (expires_at_monotonic_seconds, tools_list).  Caching is
+        # required for correctness *and* performance: rebuilding the MCP
+        # client on every chat turn performs a full transport handshake +
+        # list_tools roundtrip against each configured server.
+        self._mcp_tools_cache: Dict[Optional[str], Tuple[float, List[Callable]]] = {}
+        # TTL is short enough that SSO access tokens (typically 1 h) remain
+        # valid for the cached window; MCPOAuthService.get_access_token
+        # silently refreshes once we rebuild.
+        self._MCP_TOOLS_TTL_SECONDS = 60.0
         self._mcp_skills_text: str = ""
         self._active_tools: List[Callable] = []
         self._static_middleware: Optional[List[Callable]] = None
@@ -1076,34 +1085,34 @@ class BaseReActAgent:
     ) -> CompiledStateGraph:
         """Ensure the LangGraph agent reflects the latest tool set."""
         base_tools = list(static_tools) if static_tools is not None else self.tools
-        toolset: List[Callable] = list(base_tools)
+        extra_list: List[Callable] = list(extra_tools) if extra_tools else []
 
+        mcp_tools: List[Callable] = []
         if "mcp" in self.selected_tool_names:
-            # When user_id is present, always rebuild so each request fetches a
-            # fresh (possibly refreshed) token from the DB for SSO-auth servers.
-            # Without a user_id (anonymous), cache the tools as before.
-            if self._mcp_tools is None or user_id:
-                built = self._build_mcp_tools(user_id=user_id)
-                if not user_id:
-                    self._mcp_tools = list(built or [])
-                toolset.extend(built or [])
-            else:
-                toolset.extend(self._mcp_tools)
+            mcp_tools = list(self._get_mcp_tools_cached(user_id) or [])
 
-        if extra_tools:
-            toolset.extend(extra_tools)
-
-        # OpenAI enforces a hard 128-tool limit per request.
+        # OpenAI enforces a hard 128-tool limit per request.  Trim only the MCP
+        # portion when we exceed it — base/extra tools are configuration-locked
+        # and must be preserved.  Tracking lists separately means the slice
+        # boundaries are unambiguous regardless of internal concatenation order.
         _OPENAI_MAX_TOOLS = 128
-        if len(toolset) > _OPENAI_MAX_TOOLS:
+        n_protected = len(base_tools) + len(extra_list)
+        if n_protected + len(mcp_tools) > _OPENAI_MAX_TOOLS:
+            mcp_budget = max(0, _OPENAI_MAX_TOOLS - n_protected)
             logger.warning(
-                f"Toolset has {len(toolset)} tools, exceeding OpenAI max of {_OPENAI_MAX_TOOLS}. "
-                f"Truncating MCP tools to fit. Static tools ({len(base_tools)}) are preserved."
+                "Toolset has %d tools (%d base + %d extra + %d MCP), exceeding "
+                "OpenAI max of %d. Truncating MCP tools to %d; base + extra "
+                "preserved.",
+                n_protected + len(mcp_tools),
+                len(base_tools),
+                len(extra_list),
+                len(mcp_tools),
+                _OPENAI_MAX_TOOLS,
+                mcp_budget,
             )
-            # Keep all static/extra tools; trim only the MCP portion
-            n_static = len(base_tools) + (len(list(extra_tools)) if extra_tools else 0)
-            mcp_budget = max(0, _OPENAI_MAX_TOOLS - n_static)
-            toolset = toolset[:n_static] + toolset[n_static:n_static + mcp_budget]
+            mcp_tools = mcp_tools[:mcp_budget]
+
+        toolset: List[Callable] = base_tools + extra_list + mcp_tools
 
         middleware = list(middleware) if middleware is not None else self.middleware
 
@@ -1151,6 +1160,36 @@ class BaseReActAgent:
         selected = list(self.selected_tool_names or [])
         static_names = [name for name in selected if name != "mcp"]
         return self._select_tools_from_registry(static_names)
+
+    def _get_mcp_tools_cached(self, user_id: Optional[str]) -> Optional[List[Callable]]:
+        """Return MCP tools for *user_id*, building once per TTL window.
+
+        Rebuilding the MCP client on every chat turn is expensive (full
+        transport handshake + list_tools roundtrip per configured server).
+        We cache per user_id since SSO-gated servers select tools based on
+        the per-user OAuth token.  The TTL is short enough that
+        ``MCPOAuthService.get_access_token`` will refresh tokens before the
+        cached header goes stale.
+        """
+        cached = self._mcp_tools_cache.get(user_id)
+        now = time.monotonic()
+        if cached is not None:
+            expires_at, tools = cached
+            if expires_at > now:
+                return tools
+
+        built = self._build_mcp_tools(user_id=user_id) or []
+        self._mcp_tools_cache[user_id] = (now + self._MCP_TOOLS_TTL_SECONDS, list(built))
+        return built
+
+    def invalidate_mcp_tools_cache(self, user_id: Optional[str] = None) -> None:
+        """Drop cached MCP tools.  Pass user_id to evict one entry, or None to clear all."""
+        if user_id is None and not self._mcp_tools_cache:
+            return
+        if user_id is None:
+            self._mcp_tools_cache.clear()
+        else:
+            self._mcp_tools_cache.pop(user_id, None)
 
     def _build_mcp_tools(self, user_id: Optional[str] = None) -> List[Callable]:
         """Retrieve MCP tools from servers defined in the config and keep those server connections alive"""

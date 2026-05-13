@@ -273,6 +273,75 @@ class ConfigService:
                     )
                     """
                 )
+                # Inbound MCP client registrations (RFC 7591) — Claude Desktop,
+                # VS Code, Cursor, etc. that connect to archi's MCP SSE endpoint.
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS mcp_inbound_clients (
+                        client_id     VARCHAR(32) PRIMARY KEY,
+                        client_name   TEXT,
+                        redirect_uris TEXT[] NOT NULL,
+                        created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                # Bearer tokens used by inbound MCP clients (one row per
+                # device/token; references the inbound client registry above
+                # only via application logic, not via FK).
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS mcp_tokens (
+                        token        VARCHAR(64) PRIMARY KEY,
+                        user_id      VARCHAR(200) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        display_name TEXT,
+                        created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        last_used_at TIMESTAMPTZ,
+                        expires_at   TIMESTAMPTZ
+                    )
+                    """
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_mcp_tokens_user ON mcp_tokens(user_id)"
+                )
+                # Short-lived OAuth2 PKCE auth codes for inbound MCP clients.
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS mcp_auth_codes (
+                        code                  VARCHAR(64) PRIMARY KEY,
+                        user_id               VARCHAR(200) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        code_challenge        VARCHAR(128) NOT NULL,
+                        code_challenge_method VARCHAR(10) NOT NULL DEFAULT 'S256',
+                        redirect_uri          TEXT NOT NULL,
+                        client_id             VARCHAR(100) NOT NULL,
+                        created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        expires_at            TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '10 minutes',
+                        used                  BOOLEAN NOT NULL DEFAULT FALSE
+                    )
+                    """
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_mcp_auth_codes_expires ON mcp_auth_codes(expires_at)"
+                )
+                # Mattermost SSO refresh tokens for the Mattermost RBAC layer.
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS mattermost_tokens (
+                        mattermost_user_id  VARCHAR(255) PRIMARY KEY,
+                        mattermost_username VARCHAR(255),
+                        email               VARCHAR(255),
+                        roles               JSONB NOT NULL DEFAULT '[]',
+                        refresh_token       BYTEA,
+                        token_expires_at    TIMESTAMPTZ,
+                        roles_refreshed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_mm_tokens_username "
+                    "ON mattermost_tokens(mattermost_username)"
+                )
                 conn.commit()
         except psycopg2.Error as e:
             logger.debug("Could not ensure config tables/columns: %s", e)

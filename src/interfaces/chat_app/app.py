@@ -2724,7 +2724,7 @@ class FlaskAppWrapper(object):
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    """INSERT INTO mcp_oauth_clients (client_id, client_name, redirect_uris)
+                    """INSERT INTO mcp_inbound_clients (client_id, client_name, redirect_uris)
                        VALUES (%s, %s, %s)""",
                     (client_id, client_name, redirect_uris),
                 )

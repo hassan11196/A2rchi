@@ -148,7 +148,8 @@ CREATE TABLE IF NOT EXISTS mcp_oauth_tokens (
     PRIMARY KEY (user_id, server_name)
 );
 
--- 1.2 MCP API TOKENS (VS Code / Cursor integration)
+-- ============================================================================
+-- 1.4 MCP API TOKENS (VS Code / Cursor / Claude Desktop integration)
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS mcp_tokens (
@@ -177,8 +178,11 @@ CREATE TABLE IF NOT EXISTS mcp_auth_codes (
 
 CREATE INDEX IF NOT EXISTS idx_mcp_auth_codes_expires ON mcp_auth_codes(expires_at);
 
--- OAuth2 dynamic client registrations (RFC 7591) used by MCP clients.
-CREATE TABLE IF NOT EXISTS mcp_oauth_clients (
+-- OAuth2 dynamic client registrations (RFC 7591) for INBOUND MCP clients
+-- (e.g. Claude Desktop, VS Code, Cursor connecting to archi's MCP SSE
+-- endpoint).  Distinct from `mcp_oauth_clients` above, which records archi's
+-- OUTBOUND client registrations against remote MCP servers.
+CREATE TABLE IF NOT EXISTS mcp_inbound_clients (
     client_id VARCHAR(32) PRIMARY KEY,    -- secrets.token_hex(16)
     client_name TEXT,
     redirect_uris TEXT[] NOT NULL,
