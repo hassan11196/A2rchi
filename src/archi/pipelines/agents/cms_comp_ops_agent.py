@@ -13,6 +13,7 @@ from src.archi.pipelines.agents.tools import (
     create_metadata_search_tool,
     create_metadata_schema_tool,
     create_retriever_tool,
+    create_web_search_tool,
     initialize_mcp_client,
     RemoteCatalogClient,
     MONITOpenSearchClient,
@@ -169,6 +170,14 @@ class CMSCompOpsAgent(BaseReActAgent):
                 "builder": self._build_mcp_tools,
                 "description": "Access tools served via configured MCP servers.",
             },
+            "web_search": {
+                "builder": self._build_web_search_tool,
+                "description": (
+                    "Run a live web search (Tavily when TAVILY_API_KEY is set, "
+                    "DuckDuckGo otherwise). Use for current events, package "
+                    "versions, or external references not in the indexed corpus."
+                ),
+            },
         }
 
         # Keep this safe for lightweight introspection paths that call
@@ -231,6 +240,17 @@ class CMSCompOpsAgent(BaseReActAgent):
 
     def _build_vector_tool_placeholder(self) -> List[Callable]:
         return []
+
+    def _build_web_search_tool(self) -> Callable:
+        """Build the live web-search tool (Tavily or DuckDuckGo)."""
+        services_cfg = (self.config or {}).get("services", {}).get("chat_app", {})
+        ws_cfg = services_cfg.get("web_search", {}) if isinstance(services_cfg, dict) else {}
+        provider = ws_cfg.get("provider", "auto")
+        try:
+            max_results = int(ws_cfg.get("max_results", 5))
+        except (TypeError, ValueError):
+            max_results = 5
+        return create_web_search_tool(provider=provider, max_results=max_results)
 
     def _build_monit_opensearch_search_tool(self) -> Callable:
         """Build the MONIT OpenSearch search tool for Rucio events."""

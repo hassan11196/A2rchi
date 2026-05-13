@@ -13,6 +13,7 @@ from .monit_opensearch import (
     create_monit_opensearch_search_tool,
     create_monit_opensearch_aggregation_tool,
 )
+from .web_search import create_web_search_tool
 
 __all__ = [
     "check_tool_permission",
@@ -27,4 +28,5 @@ __all__ = [
     "MONITOpenSearchClient",
     "create_monit_opensearch_search_tool",
     "create_monit_opensearch_aggregation_tool",
+    "create_web_search_tool",
 ]
