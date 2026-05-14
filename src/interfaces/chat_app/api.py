@@ -1099,6 +1099,7 @@ def get_api_info():
 # ---------------------------------------------------------------------------
 
 @api.route('/tool-approvals/<approval_id>', methods=['GET'])
+@require_client_id
 def get_tool_approval(approval_id: str):
     """Return the current state of a pending/decided tool-approval row."""
     try:
@@ -1113,6 +1114,7 @@ def get_tool_approval(approval_id: str):
 
 
 @api.route('/tool-approvals/<approval_id>', methods=['POST'])
+@require_client_id
 def decide_tool_approval(approval_id: str):
     """Approve or deny a pending tool call.
 
@@ -1132,8 +1134,9 @@ def decide_tool_approval(approval_id: str):
             'detail': "decision must be 'approve' or 'deny'",
         }), 400
 
+    # Session schema set by _set_user_session() has 'username', not 'user_id'.
     decided_by = (
-        (session.get('user') or {}).get('user_id')
+        (session.get('user') or {}).get('username')
         or g.get('client_id')
         or 'anonymous'
     )
