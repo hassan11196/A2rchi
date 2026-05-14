@@ -94,7 +94,7 @@ class ConversationService:
     def _get_connection(self):
         """Get a database connection."""
         if self._pool:
-            return self._pool.get_connection()
+            return self._pool.get_connection_direct()
         elif self._conn_params:
             return psycopg2.connect(**self._conn_params)
         else:

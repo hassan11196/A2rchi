@@ -1274,7 +1274,11 @@ class BaseReActAgent:
                         tool_args=recorded,
                     )
                     if guard_msg is not None:
-                        return guard_msg
+                        # Tool is registered with response_format='content_and_artifact',
+                        # so langchain requires a (content, artifact) tuple even for
+                        # short-circuit returns. The artifact is None since no MCP
+                        # call was made.
+                        return guard_msg, None
 
                     # Run on the background loop - NOT a new loop!
                     return runner.run(async_tool.coroutine(*args, **kwargs))
