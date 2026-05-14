@@ -3552,42 +3552,38 @@ body {
    out of the way when nothing is pending.
    ----------------------------------------------------------------------------- */
 
-/* Permission-mode pill row. Always visible so the user knows which mode is
-   active without opening Settings, and can switch with one click. */
+/* Permission-mode pill. Lives inside .input-left-controls next to the
+   settings cog + agent dropdown, so the input area's height NEVER
+   changes when an approval is or isn't pending. Click opens the popover. */
 .approval-mode-bar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 0 4px 6px 4px;
-  font-size: 11px;
-  color: var(--text-secondary);
-}
-
-.approval-mode-bar__label {
-  font-weight: 500;
-}
-
-.approval-mode-bar__picker {
   position: relative;
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
 }
 
 .approval-mode-bar__toggle {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  background: var(--bg-secondary);
+  background: transparent;
   border: 1px solid var(--border-color);
-  border-radius: 12px;
-  padding: 2px 8px;
+  border-radius: 14px;
+  padding: 3px 8px;
   font-size: 11px;
-  color: var(--text-primary);
+  line-height: 1;
+  color: var(--text-secondary);
   cursor: pointer;
-  transition: background 0.15s ease, border-color 0.15s ease;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.approval-mode-bar__icon {
+  flex-shrink: 0;
+  opacity: 0.7;
 }
 
 .approval-mode-bar__toggle:hover {
   background: var(--bg-hover);
+  color: var(--text-primary);
 }
 
 .approval-mode-bar[data-mode="bypassPermissions"] .approval-mode-bar__toggle {
