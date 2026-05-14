@@ -63,7 +63,8 @@ class PostgresServiceFactory:
         self._conversation_service: Optional[ConversationService] = None
         self._document_selection_service: Optional[DocumentSelectionService] = None
         self._tool_approval_service = None  # Optional["ToolApprovalService"]
-    
+        self._user_action_service = None  # Optional["UserActionService"]
+
     @classmethod
     def from_config(
         cls,
@@ -233,6 +234,21 @@ class PostgresServiceFactory:
             )
         return self._tool_approval_service
 
+    @property
+    def user_action_service(self):
+        """Get UserActionService (lazy-initialized).
+
+        Imported lazily so the factory module stays light and the new audit
+        subsystem can be removed cleanly if ever needed.
+        """
+        if self._user_action_service is None:
+            from src.utils.user_action_service import UserActionService
+
+            self._user_action_service = UserActionService(
+                connection_pool=self.connection_pool,
+            )
+        return self._user_action_service
+
     def close(self) -> None:
         """Close connection pool and cleanup resources."""
         if self._pool:
@@ -245,7 +261,8 @@ class PostgresServiceFactory:
         self._conversation_service = None
         self._document_selection_service = None
         self._tool_approval_service = None
-    
+        self._user_action_service = None
+
     def __enter__(self) -> 'PostgresServiceFactory':
         """Context manager entry."""
         return self
