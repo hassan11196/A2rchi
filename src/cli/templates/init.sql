@@ -594,6 +594,35 @@ CREATE INDEX IF NOT EXISTS idx_tool_calls_conv ON agent_tool_calls(conversation_
 CREATE INDEX IF NOT EXISTS idx_tool_calls_tool ON agent_tool_calls(tool_name);
 
 -- ============================================================================
+-- 7.1 MCP TOOL APPROVALS (Claude-style write/execute gate)
+-- ============================================================================
+-- Records each (conversation, tool, args) trigger of the MCP guardrail flow.
+-- Lifecycle: pending → approved | denied | expired.
+
+CREATE TABLE IF NOT EXISTS tool_approvals (
+    approval_id     VARCHAR(64) PRIMARY KEY,
+    conversation_id INTEGER,
+    message_id      INTEGER,
+    user_id         VARCHAR(200),
+    server_name     VARCHAR(200) NOT NULL,
+    tool_name       VARCHAR(200) NOT NULL,
+    tool_args       JSONB NOT NULL DEFAULT '{}'::jsonb,
+    args_hash       VARCHAR(64) NOT NULL,
+    sensitivity     VARCHAR(20) NOT NULL DEFAULT 'write',
+    status          VARCHAR(20) NOT NULL DEFAULT 'pending',
+    requested_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    decided_at      TIMESTAMPTZ,
+    decided_by      VARCHAR(200),
+    expires_at      TIMESTAMPTZ NOT NULL,
+    source          VARCHAR(20) NOT NULL DEFAULT 'chat'
+);
+
+CREATE INDEX IF NOT EXISTS idx_tool_approvals_lookup
+    ON tool_approvals (conversation_id, tool_name, args_hash, status);
+CREATE INDEX IF NOT EXISTS idx_tool_approvals_status_expires
+    ON tool_approvals (status, expires_at);
+
+-- ============================================================================
 -- 8. A/B COMPARISON TRACKING
 -- ============================================================================
 

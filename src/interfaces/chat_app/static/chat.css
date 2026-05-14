@@ -3541,6 +3541,593 @@ body {
 }
 
 /* -----------------------------------------------------------------------------
+   MCP Tool Approval Footer Stack
+     [approval-mode-bar]   persistent ~22px pill row (current mode + popover)
+     [approval-tray]       0..n pending approval cards
+     [input-wrapper]       the chat input itself
+
+   Modeled on Cline's action-buttons + auto-approve bar layout
+   (https://github.com/cline/cline/tree/main/webview-ui/src/components/chat/chat-view/components/layout)
+   — pinned above the input, never overlays the message scroller, collapses
+   out of the way when nothing is pending.
+   ----------------------------------------------------------------------------- */
+
+/* Permission-mode pill. Lives inside .input-left-controls next to the
+   settings cog + agent dropdown, so the input area's height NEVER
+   changes when an approval is or isn't pending. Click opens the popover. */
+.approval-mode-bar {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.approval-mode-bar__toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: transparent;
+  border: 1px solid var(--border-color);
+  border-radius: 14px;
+  padding: 3px 8px;
+  font-size: 11px;
+  line-height: 1;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.approval-mode-bar__icon {
+  flex-shrink: 0;
+  opacity: 0.7;
+}
+
+.approval-mode-bar__toggle:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.approval-mode-bar[data-mode="bypassPermissions"] .approval-mode-bar__toggle {
+  border-color: var(--warning-color, #ca8a04);
+  color: var(--warning-color, #ca8a04);
+}
+
+.approval-mode-bar[data-mode="acceptEdits"] .approval-mode-bar__toggle,
+.approval-mode-bar[data-mode="plan"] .approval-mode-bar__toggle {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.approval-mode-bar__menu {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 6px);
+  z-index: 20;
+  min-width: 240px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.approval-mode-bar__menu[hidden] {
+  display: none;
+}
+
+.approval-mode-bar__menu button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 12px;
+  color: var(--text-primary);
+  cursor: pointer;
+  text-align: left;
+}
+
+.approval-mode-bar__menu button:hover {
+  background: var(--bg-hover);
+}
+
+.approval-mode-bar__menu button.is-active {
+  background: var(--accent-light);
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.approval-mode-bar__menu-tag {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--bg-hover);
+  color: var(--text-secondary);
+}
+
+.approval-mode-bar__menu-tag--warn {
+  background: var(--warning-color, #ca8a04);
+  color: #fff;
+}
+
+/* Tray + cards. Inherits centered width from .input-container. */
+.approval-tray {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  margin-bottom: 6px;
+  max-height: 30vh;
+  overflow-y: auto;
+}
+
+.approval-tray[hidden] {
+  display: none;
+}
+
+.approval-step .approval-marker,
+.approval-marker-step .approval-marker {
+  background: rgba(202, 138, 4, 0.12);
+  border-color: var(--warning-color, #ca8a04);
+  color: var(--warning-color, #ca8a04);
+  font-weight: 700;
+  font-size: 11px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.approval-marker-status {
+  font-size: 11px;
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
+/* Single-row banner: icon | tool | sensitivity | server | <args/> | always |
+   <spacer> | deny | approve. */
+.tool-approval-card {
+  border: 1px solid var(--warning-color, #ca8a04);
+  border-radius: 10px;
+  background: rgba(202, 138, 4, 0.1);
+  color: var(--text-primary);
+  width: 100%;
+  padding: 0;
+  margin: 0;
+}
+
+.tool-approval-card__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  min-height: 36px;
+  flex-wrap: wrap;
+}
+
+.tool-approval-card[data-status="approved"] {
+  border-color: var(--accent);
+  background: var(--accent-light);
+}
+
+.tool-approval-card[data-status="denied"],
+.tool-approval-card[data-status="expired"] {
+  border-color: var(--border-color);
+  background: var(--bg-secondary);
+  opacity: 0.85;
+}
+
+.tool-approval-card__icon {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--warning-color, #ca8a04);
+  color: #fff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 11px;
+  line-height: 1;
+}
+
+.tool-approval-card__title {
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 320px;
+}
+
+.tool-approval-card__title code {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  background: rgba(0, 0, 0, 0.06);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+.tool-approval-card__server {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.tool-approval-card__sensitivity {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 600;
+  background: var(--warning-color, #ca8a04);
+  color: #fff;
+}
+
+.tool-approval-card__sensitivity--execute {
+  background: var(--error-text, #b91c1c);
+}
+
+/* "args" is rendered as a small chip; clicking it reveals a capped-height
+   <pre> below the row without pushing the chat off-screen. */
+.tool-approval-card__args {
+  font-size: 11px;
+}
+
+.tool-approval-card__args summary {
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+  padding: 1px 8px;
+  border-radius: 10px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  display: inline-block;
+}
+
+.tool-approval-card__args summary::-webkit-details-marker {
+  display: none;
+}
+
+.tool-approval-card__args[open] summary {
+  background: var(--bg-hover);
+}
+
+.tool-approval-card__args pre {
+  margin: 6px 0 0 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-primary);
+  overflow: auto;
+  max-height: 160px;
+  flex-basis: 100%;
+}
+
+.tool-approval-card__args pre code {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.tool-approval-card__remember {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  user-select: none;
+}
+
+.tool-approval-card__remember input {
+  margin: 0;
+  cursor: pointer;
+}
+
+.tool-approval-card__spacer {
+  flex: 1;
+  min-width: 8px;
+}
+
+.tool-approval-card__btn {
+  min-height: 26px;
+  padding: 3px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: background 0.15s ease, opacity 0.15s ease;
+}
+
+.tool-approval-card__btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.tool-approval-card__btn--deny {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border-color: var(--border-color);
+}
+
+.tool-approval-card__btn--deny:not(:disabled):hover {
+  background: var(--bg-hover);
+}
+
+.tool-approval-card__btn--approve {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+.tool-approval-card__btn--approve:not(:disabled):hover {
+  background: var(--accent-hover);
+}
+
+.tool-approval-card__status {
+  padding: 0 10px 6px 10px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
+/* -----------------------------------------------------------------------------
+   Settings > Permissions
+   ----------------------------------------------------------------------------- */
+.approval-mode-fieldset {
+  border: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.approval-mode-fieldset legend {
+  font-weight: 500;
+  margin-bottom: 4px;
+}
+
+.approval-mode-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+.approval-mode-option:hover {
+  background: var(--bg-hover);
+}
+
+.approval-mode-option input[type="radio"] {
+  margin-top: 2px;
+}
+
+.approval-mode-option input[type="radio"]:checked + .approval-mode-option__body .approval-mode-option__label {
+  color: var(--accent);
+}
+
+.approval-mode-option:has(input:checked) {
+  border-color: var(--accent);
+  background: var(--accent-light);
+}
+
+.approval-mode-option__body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.approval-mode-option__label {
+  font-weight: 500;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.approval-mode-option__hint {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.approval-mode-option__tag {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 10px;
+  text-transform: none;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--bg-hover);
+  color: var(--text-secondary);
+}
+
+.approval-mode-option__tag--warn {
+  background: var(--warning-color, #ca8a04);
+  color: #fff;
+}
+
+.allowed-tools-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.allowed-tools-list__item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-primary);
+  font-size: 13px;
+}
+
+.allowed-tools-list__item code {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+}
+
+.allowed-tools-list__remove {
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 4px 6px;
+  border-radius: 4px;
+}
+
+.allowed-tools-list__remove:hover {
+  background: var(--bg-hover);
+  color: var(--error-text);
+}
+
+/* Approval history table — every gated tool decision, regardless of how
+   it was resolved (explicit / acceptEdits / bypassPermissions /
+   always-allow / plan denial). */
+.approval-history-filter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.approval-history-filter select {
+  font-size: 12px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+}
+
+.approval-history {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.approval-history th {
+  text-align: left;
+  font-weight: 500;
+  color: var(--text-secondary);
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border-color);
+  position: sticky;
+  top: 0;
+  background: var(--bg-primary);
+}
+
+.approval-history td {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border-color);
+  vertical-align: middle;
+}
+
+.approval-history__row:hover {
+  background: var(--bg-hover);
+}
+
+.approval-history__when {
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.approval-history__tool code {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11px;
+}
+
+.approval-history__by {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.approval-history__sev {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 600;
+  background: var(--bg-hover);
+  color: var(--text-secondary);
+}
+
+.approval-history__sev--write {
+  background: var(--warning-color, #ca8a04);
+  color: #fff;
+}
+
+.approval-history__sev--execute {
+  background: var(--error-text, #b91c1c);
+  color: #fff;
+}
+
+.approval-history__status {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 600;
+}
+
+.approval-history__status--approved {
+  background: var(--accent-light);
+  color: var(--accent);
+}
+
+.approval-history__status--denied,
+.approval-history__status--expired {
+  background: var(--bg-hover);
+  color: var(--text-secondary);
+}
+
+.approval-history__status--pending {
+  background: rgba(202, 138, 4, 0.16);
+  color: var(--warning-color, #ca8a04);
+}
+
+.settings-description--error {
+  color: var(--error-text);
+}
+
+/* -----------------------------------------------------------------------------
    Cancel Button
    ----------------------------------------------------------------------------- */
 .cancel-stream-btn {
