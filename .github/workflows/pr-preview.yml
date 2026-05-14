@@ -132,7 +132,13 @@ jobs:
           scripts/dev/build_docker_images.sh -i a2rchi/a2rchi-python-base "${{ steps.detect.outputs.tag }}"
 
       - name: Push updated base image to Docker Hub
-        if: steps.detect.outputs.changed == 'true'
+        # Skip when Docker Hub credentials aren't available — for example
+        # PRs from contexts where secrets aren't injected.  The image was
+        # already built and validated in the previous step; the push is
+        # what publishes it, and there's nothing useful we can do without
+        # credentials.  This avoids cascading the failure to dependent
+        # jobs (preview) on every PR that touches requirements-base.txt.
+        if: steps.detect.outputs.changed == 'true' && env.DOCKERHUB_USERNAME != ''
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -141,6 +147,14 @@ jobs:
           set -euo pipefail
           echo "$DOCKERHUB_TOKEN" | docker login docker.io --username "$DOCKERHUB_USERNAME" --password-stdin
           docker push "a2rchi/a2rchi-python-base:${TAG}"
+
+      - name: Note skipped Docker Hub push
+        if: steps.detect.outputs.changed == 'true' && env.DOCKERHUB_USERNAME == ''
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          echo "Skipping Docker Hub push: DOCKERHUB_USERNAME not available in this context." >> "$GITHUB_STEP_SUMMARY"
+          echo "The base image was built and validated locally; push will happen on a context with secrets." >> "$GITHUB_STEP_SUMMARY"
 
   # ── Smoke deployment + integration tests ────────────────────────────
   preview:
