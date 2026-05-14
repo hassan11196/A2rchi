@@ -3381,6 +3381,11 @@ const UI = {
     tray.insertAdjacentHTML('beforeend', cardHtml);
     tray.hidden = false;
 
+    // The tray growing taller shrinks the messages region, which means
+    // the user's anchor at the bottom of the chat falls behind the input
+    // area. Re-anchor after layout so the latest content stays in view.
+    requestAnimationFrame(() => this.scrollToBottom());
+
     // Audit marker in the trace timeline so the conversation history
     // reflects that an approval was raised inside this turn.
     this._renderTraceApprovalMarker(messageId, approvalId, toolName, sensitivity);
@@ -3463,6 +3468,7 @@ const UI = {
     if (tray && !tray.querySelector('.tool-approval-card')) {
       tray.hidden = true;
     }
+    requestAnimationFrame(() => this.scrollToBottom());
   },
 
   refreshApprovalModeIndicator() {

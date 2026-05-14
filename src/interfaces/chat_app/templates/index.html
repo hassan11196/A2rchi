@@ -109,42 +109,9 @@
     <!-- Input -->
     <footer class="input-area">
       <div class="input-container">
-        <!-- Approval footer stack modeled on Cline's auto-approve bar +
-             action-buttons row (https://github.com/cline/cline). Compact,
-             pinned above the input, collapses when nothing is pending. -->
-        <div class="approval-mode-bar" aria-label="Tool permission mode">
-          <span class="approval-mode-bar__label">Permissions</span>
-          <div class="approval-mode-bar__picker">
-            <button type="button"
-                    class="approval-mode-bar__toggle"
-                    data-approval-mode-indicator
-                    aria-haspopup="menu"
-                    aria-expanded="false">
-              <span class="approval-mode-bar__current">Ask every time</span>
-              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" aria-hidden="true">
-                <polyline points="6 9 12 15 18 9"></polyline>
-              </svg>
-            </button>
-            <div class="approval-mode-bar__menu" role="menu" hidden>
-              <button type="button" role="menuitemradio" data-approval-mode="default">
-                <span class="approval-mode-bar__menu-label">Ask every time</span>
-                <span class="approval-mode-bar__menu-tag">default</span>
-              </button>
-              <button type="button" role="menuitemradio" data-approval-mode="acceptEdits">
-                <span class="approval-mode-bar__menu-label">Accept writes</span>
-                <span class="approval-mode-bar__menu-tag">acceptEdits</span>
-              </button>
-              <button type="button" role="menuitemradio" data-approval-mode="bypassPermissions">
-                <span class="approval-mode-bar__menu-label">Bypass all</span>
-                <span class="approval-mode-bar__menu-tag approval-mode-bar__menu-tag--warn">bypassPermissions</span>
-              </button>
-              <button type="button" role="menuitemradio" data-approval-mode="plan">
-                <span class="approval-mode-bar__menu-label">Plan (read-only)</span>
-                <span class="approval-mode-bar__menu-tag">plan</span>
-              </button>
-            </div>
-          </div>
-        </div>
+        <!-- Tray holds the actual pending-approval card(s). Hidden by
+             default so the chat doesn't lose vertical real-estate to an
+             empty container. -->
         <div class="approval-tray" hidden aria-live="polite" aria-label="Pending tool approvals"></div>
         <div class="input-wrapper">
           <div class="input-left-controls">
@@ -174,7 +141,46 @@
                 </button>
               </div>
             </div>
-            
+
+            <!-- MCP permission-mode pill, modeled on Cline's auto-approve
+                 bar (https://github.com/cline/cline). Lives inside the
+                 existing input controls so it never adds an extra row to
+                 the input area. -->
+            <div class="approval-mode-bar" data-mode="default">
+              <button type="button"
+                      class="approval-mode-bar__toggle"
+                      data-approval-mode-indicator
+                      title="Tool permission mode"
+                      aria-haspopup="menu"
+                      aria-expanded="false">
+                <svg class="approval-mode-bar__icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                  <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+                </svg>
+                <span class="approval-mode-bar__current">Ask every time</span>
+                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" aria-hidden="true">
+                  <polyline points="6 9 12 15 18 9"></polyline>
+                </svg>
+              </button>
+              <div class="approval-mode-bar__menu" role="menu" hidden>
+                <button type="button" role="menuitemradio" data-approval-mode="default">
+                  <span class="approval-mode-bar__menu-label">Ask every time</span>
+                  <span class="approval-mode-bar__menu-tag">default</span>
+                </button>
+                <button type="button" role="menuitemradio" data-approval-mode="acceptEdits">
+                  <span class="approval-mode-bar__menu-label">Accept writes</span>
+                  <span class="approval-mode-bar__menu-tag">acceptEdits</span>
+                </button>
+                <button type="button" role="menuitemradio" data-approval-mode="bypassPermissions">
+                  <span class="approval-mode-bar__menu-label">Bypass all</span>
+                  <span class="approval-mode-bar__menu-tag approval-mode-bar__menu-tag--warn">bypassPermissions</span>
+                </button>
+                <button type="button" role="menuitemradio" data-approval-mode="plan">
+                  <span class="approval-mode-bar__menu-label">Plan (read-only)</span>
+                  <span class="approval-mode-bar__menu-tag">plan</span>
+                </button>
+              </div>
+            </div>
+
           </div>
           <textarea class="input-field" placeholder="Ask archi..." rows="1" aria-label="Message input"></textarea>
           <button class="send-btn" title="Send message" aria-label="Send message">
