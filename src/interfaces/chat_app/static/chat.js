@@ -19,7 +19,13 @@ const CONFIG = {
     SELECTED_PROVIDER: 'archi_selected_provider',
     SELECTED_MODEL: 'archi_selected_model',
     SELECTED_MODEL_CUSTOM: 'archi_selected_model_custom',
+    APPROVAL_MODE: 'archi_approval_mode',
+    APPROVED_TOOLS: 'archi_approved_tools',
   },
+  // MCP permission modes. Names mirror Claude Agent SDK / Claude Code so
+  // the contract is identical at the API boundary.
+  // https://docs.claude.com/en/api/agent-sdk/permissions
+  APPROVAL_MODES: ['default', 'acceptEdits', 'bypassPermissions', 'plan'],
   ENDPOINTS: {
     STREAM: '/api/get_chat_response_stream',
     CONFIGS: '/api/get_configs',
@@ -306,6 +312,11 @@ const API = {
   },
 
   async *streamResponse(history, conversationId, configName, signal = null, provider = null, model = null) {
+    // Pull live approval prefs at request time so a settings change takes
+    // effect on the *next* turn without needing a reload.
+    const approvalPrefs = (typeof Chat !== 'undefined' && Chat.getApprovalRequestPayload)
+      ? Chat.getApprovalRequestPayload()
+      : { permission_mode: 'default', allowed_tools: [] };
     const response = await fetch(CONFIG.ENDPOINTS.STREAM, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -320,6 +331,8 @@ const API = {
         include_tool_steps: true,
         provider: provider,
         model: model,
+        permission_mode: approvalPrefs.permission_mode,
+        allowed_tools: approvalPrefs.allowed_tools,
       }),
       signal: signal,
     });
@@ -977,6 +990,21 @@ const UI = {
       }
     });
 
+    // Permission mode radios — Settings > Permissions
+    document.addEventListener('change', (e) => {
+      if (e.target && e.target.name === 'approval-mode') {
+        Chat.setApprovalMode(e.target.value);
+      }
+    });
+
+    // Always-allowed tools — remove buttons (delegated)
+    document.addEventListener('click', (e) => {
+      const removeBtn = e.target.closest && e.target.closest('.allowed-tools-list__remove');
+      if (removeBtn) {
+        Chat.removeAlwaysAllowedTool(removeBtn.dataset.allowedTool);
+      }
+    });
+
     this.elements.darkModeToggle?.addEventListener('change', (e) => {
       const isDark = e.target.checked;
       document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
@@ -1082,6 +1110,11 @@ const UI = {
     if (targetSection) {
       targetSection.classList.add('active');
       targetSection.hidden = false;
+    }
+
+    if (sectionId === 'permissions') {
+      this.refreshApprovalModeIndicator();
+      this.refreshAlwaysAllowedToolsList();
     }
   },
 
@@ -3239,33 +3272,44 @@ const UI = {
 
   // =========================================================================
   // MCP Tool Approval Card
+  //
+  // Rendered inside the .approval-tray container above the chat input, so
+  // pending approvals are next to the user's attention regardless of where
+  // they are in the message list. A compact "Approval requested" marker is
+  // also dropped into the trace timeline so the conversation history shows
+  // the event was raised.
   // =========================================================================
+
+  getApprovalTray() {
+    let tray = document.querySelector('.approval-tray');
+    if (!tray) {
+      // Fallback if the markup is missing: create one above the input footer.
+      const footer = document.querySelector('footer.input-area');
+      if (!footer) return null;
+      tray = document.createElement('div');
+      tray.className = 'approval-tray';
+      tray.hidden = true;
+      footer.insertBefore(tray, footer.firstChild);
+    }
+    return tray;
+  },
 
   renderToolApprovalRequest(messageId, event) {
     if (!event || !event.approval_id) return;
-
-    // Approval must surface even when trace UI is hidden / collapsed.
-    this.createTraceContainer(messageId);
-    const trace = document.querySelector(`.trace-container[data-message-id="${messageId}"]`);
-    if (!trace) return;
-    if (trace.classList.contains('collapsed')) {
-      trace.classList.remove('collapsed');
-      const ti = trace.querySelector('.toggle-icon');
-      if (ti) ti.innerHTML = '&#9660;';
-    }
-
-    const timeline = trace.querySelector('.step-timeline');
-    if (!timeline) return;
+    const tray = this.getApprovalTray();
+    if (!tray) return;
 
     const approvalId = String(event.approval_id);
-    const existing = timeline.querySelector(
+    const existing = tray.querySelector(
       `.tool-approval-card[data-approval-id="${CSS.escape(approvalId)}"]`
     );
     if (existing) {
-      // Re-fire on retry: just re-enable buttons if still pending.
+      // The agent re-fired the same approval (e.g. retry within a turn).
+      // Reset the card to pending so the user can act again.
       if (existing.dataset.status !== 'pending') {
         this.updateToolApprovalCard(approvalId, { status: 'pending' });
       }
+      tray.hidden = false;
       return;
     }
 
@@ -3274,50 +3318,84 @@ const UI = {
     const serverName = event.server_name || '';
     const argsText = this.formatToolArgs(event.tool_args);
     const idAttr = Utils.escapeAttr(approvalId);
+    const toolKey = serverName ? `${serverName}:${toolName}` : toolName;
+    const toolKeyAttr = Utils.escapeAttr(toolKey);
 
+    const cardHtml = `
+      <div class="tool-approval-card" data-approval-id="${idAttr}" data-tool-key="${toolKeyAttr}" data-status="pending" role="group" aria-label="Tool approval required">
+        <div class="tool-approval-card__header">
+          <span class="tool-approval-card__icon" aria-hidden="true">!</span>
+          <div class="tool-approval-card__titles">
+            <div class="tool-approval-card__title">
+              Approve <code>${Utils.escapeHtml(toolName)}</code>?
+            </div>
+            <div class="tool-approval-card__meta">
+              ${serverName ? `<span class="tool-approval-card__server">${Utils.escapeHtml(serverName)}</span>` : ''}
+              <span class="tool-approval-card__sensitivity tool-approval-card__sensitivity--${Utils.escapeAttr(sensitivity)}">${Utils.escapeHtml(sensitivity)}</span>
+            </div>
+          </div>
+        </div>
+        <details class="tool-approval-card__args">
+          <summary>Arguments</summary>
+          <pre><code>${Utils.escapeHtml(argsText)}</code></pre>
+        </details>
+        <label class="tool-approval-card__remember">
+          <input type="checkbox" class="tool-approval-card__remember-input" />
+          <span>Don't ask again for <code>${Utils.escapeHtml(toolName)}</code></span>
+        </label>
+        <div class="tool-approval-card__actions">
+          <button type="button"
+                  class="tool-approval-card__btn tool-approval-card__btn--deny"
+                  onclick="Chat.handleToolApprovalDecision('${idAttr}', 'deny')">Deny</button>
+          <button type="button"
+                  class="tool-approval-card__btn tool-approval-card__btn--approve"
+                  onclick="Chat.handleToolApprovalDecision('${idAttr}', 'approve')">Approve</button>
+        </div>
+        <div class="tool-approval-card__status" hidden></div>
+      </div>`;
+    tray.insertAdjacentHTML('beforeend', cardHtml);
+    tray.hidden = false;
+
+    // Audit marker in the trace timeline so the conversation history
+    // reflects that an approval was raised inside this turn.
+    this._renderTraceApprovalMarker(messageId, approvalId, toolName, sensitivity);
+  },
+
+  _renderTraceApprovalMarker(messageId, approvalId, toolName, sensitivity) {
+    this.createTraceContainer(messageId);
+    const timeline = document.querySelector(
+      `.trace-container[data-message-id="${messageId}"] .step-timeline`
+    );
+    if (!timeline) return;
+    if (timeline.querySelector(`.approval-marker-step[data-approval-id="${CSS.escape(String(approvalId))}"]`)) {
+      return;
+    }
+    const idAttr = Utils.escapeAttr(approvalId);
     const html = `
-      <div class="step approval-step" data-step-id="approval-${idAttr}" data-approval-id="${idAttr}">
+      <div class="step approval-marker-step" data-step-id="approval-${idAttr}" data-approval-id="${idAttr}">
         <div class="step-connector">
           <span class="step-marker approval-marker" aria-hidden="true">!</span>
           <div class="step-line"></div>
         </div>
         <div class="step-content">
-          <div class="tool-approval-card" data-approval-id="${idAttr}" data-status="pending" role="group" aria-label="Tool approval required">
-            <div class="tool-approval-card__header">
-              <div class="tool-approval-card__titles">
-                <div class="tool-approval-card__title">
-                  Approve <code>${Utils.escapeHtml(toolName)}</code>?
-                </div>
-                <div class="tool-approval-card__meta">
-                  ${serverName ? `<span class="tool-approval-card__server">${Utils.escapeHtml(serverName)}</span>` : ''}
-                  <span class="tool-approval-card__sensitivity tool-approval-card__sensitivity--${Utils.escapeAttr(sensitivity)}">${Utils.escapeHtml(sensitivity)}</span>
-                </div>
-              </div>
-            </div>
-            <details class="tool-approval-card__args">
-              <summary>Arguments</summary>
-              <pre><code>${Utils.escapeHtml(argsText)}</code></pre>
-            </details>
-            <div class="tool-approval-card__actions">
-              <button type="button"
-                      class="tool-approval-card__btn tool-approval-card__btn--deny"
-                      onclick="Chat.handleToolApprovalDecision('${idAttr}', 'deny')">Deny</button>
-              <button type="button"
-                      class="tool-approval-card__btn tool-approval-card__btn--approve"
-                      onclick="Chat.handleToolApprovalDecision('${idAttr}', 'approve')">Approve</button>
-            </div>
-            <div class="tool-approval-card__status" hidden></div>
+          <div class="step-header">
+            <span class="step-label">Approval requested: <code>${Utils.escapeHtml(toolName)}</code> (${Utils.escapeHtml(sensitivity)})</span>
+            <span class="step-status approval-marker-status">pending</span>
           </div>
         </div>
       </div>`;
     timeline.insertAdjacentHTML('beforeend', html);
-    this.scrollToBottom();
   },
 
   updateToolApprovalCard(approvalId, { status, decidedBy = null, error = null } = {}) {
     const card = document.querySelector(
       `.tool-approval-card[data-approval-id="${CSS.escape(String(approvalId))}"]`
     );
+    const marker = document.querySelector(
+      `.approval-marker-step[data-approval-id="${CSS.escape(String(approvalId))}"] .approval-marker-status`
+    );
+    if (marker) marker.textContent = status;
+
     if (!card) return;
     card.dataset.status = status;
     const buttons = card.querySelectorAll('.tool-approval-card__btn');
@@ -3333,17 +3411,71 @@ const UI = {
     }
 
     buttons.forEach((b) => { b.disabled = true; });
-    if (!statusEl) return;
+    if (statusEl) {
+      let msg;
+      if (status === 'approved') msg = decidedBy ? `Approved by ${decidedBy}.` : 'Approved.';
+      else if (status === 'denied') msg = decidedBy ? `Denied by ${decidedBy}.` : 'Denied.';
+      else if (status === 'expired') msg = 'Approval request expired.';
+      else if (status === 'error') msg = error || 'Could not record decision.';
+      else msg = status;
+      statusEl.textContent = msg;
+      statusEl.hidden = false;
+    }
 
-    let msg;
-    if (status === 'approved') msg = decidedBy ? `Approved by ${decidedBy}.` : 'Approved.';
-    else if (status === 'denied') msg = decidedBy ? `Denied by ${decidedBy}.` : 'Denied.';
-    else if (status === 'expired') msg = 'Approval request expired.';
-    else if (status === 'error') msg = error || 'Could not record decision.';
-    else msg = status;
+    // Auto-collapse decided cards out of the tray after a short delay so
+    // the input area doesn't accumulate noise turn after turn.
+    if (status === 'approved' || status === 'denied' || status === 'expired') {
+      setTimeout(() => this.removeToolApprovalCard(approvalId), 2500);
+    }
+  },
 
-    statusEl.textContent = msg;
-    statusEl.hidden = false;
+  removeToolApprovalCard(approvalId) {
+    const card = document.querySelector(
+      `.tool-approval-card[data-approval-id="${CSS.escape(String(approvalId))}"]`
+    );
+    if (card) card.remove();
+    const tray = document.querySelector('.approval-tray');
+    if (tray && !tray.querySelector('.tool-approval-card')) {
+      tray.hidden = true;
+    }
+  },
+
+  refreshApprovalModeIndicator() {
+    const mode = Chat.getApprovalMode();
+    document.querySelectorAll('[data-approval-mode-indicator]').forEach((el) => {
+      el.textContent = UI._approvalModeLabel(mode);
+      el.dataset.mode = mode;
+    });
+    const radios = document.querySelectorAll('input[name="approval-mode"]');
+    radios.forEach((r) => { r.checked = (r.value === mode); });
+  },
+
+  _approvalModeLabel(mode) {
+    switch (mode) {
+      case 'acceptEdits': return 'Accept writes';
+      case 'bypassPermissions': return 'Bypass all';
+      case 'plan': return 'Plan (read-only)';
+      default: return 'Ask every time';
+    }
+  },
+
+  refreshAlwaysAllowedToolsList() {
+    const container = document.querySelector('[data-allowed-tools-list]');
+    if (!container) return;
+    const tools = Chat.getAlwaysAllowedTools();
+    if (!tools.length) {
+      container.innerHTML = '<p class="settings-description">No tools pinned. Use "Don\'t ask again" on an approval prompt to add one.</p>';
+      return;
+    }
+    container.innerHTML = `
+      <ul class="allowed-tools-list">
+        ${tools.map((t) => `
+          <li class="allowed-tools-list__item">
+            <code>${Utils.escapeHtml(t)}</code>
+            <button type="button" class="allowed-tools-list__remove"
+                    data-allowed-tool="${Utils.escapeAttr(t)}" aria-label="Remove ${Utils.escapeAttr(t)}">&#10005;</button>
+          </li>`).join('')}
+      </ul>`;
   },
 
   // =========================================================================
@@ -3915,6 +4047,11 @@ const Chat = {
   async init() {
     Markdown.init();
     UI.init();
+
+    // Reflect persisted approval prefs in the Settings panel immediately
+    // so opening Settings shows the active mode without a race.
+    UI.refreshApprovalModeIndicator();
+    UI.refreshAlwaysAllowedToolsList();
 
     // Load initial data
     await Promise.all([
@@ -5099,13 +5236,80 @@ const Chat = {
     }
   },
 
+  // =========================================================================
+  // MCP Tool Approval — permission mode + always-allow list
+  // =========================================================================
+
+  getApprovalMode() {
+    const stored = localStorage.getItem(CONFIG.STORAGE_KEYS.APPROVAL_MODE);
+    return CONFIG.APPROVAL_MODES.includes(stored) ? stored : 'default';
+  },
+
+  setApprovalMode(mode) {
+    if (!CONFIG.APPROVAL_MODES.includes(mode)) return;
+    localStorage.setItem(CONFIG.STORAGE_KEYS.APPROVAL_MODE, mode);
+    UI.refreshApprovalModeIndicator?.();
+  },
+
+  // Always-allowed tools is a set of strings, either bare tool names
+  // ("workflow_search_post") or qualified ("unified:workflow_search_post").
+  // The backend guardrail matches both forms, so the frontend can pin
+  // either granularity.
+  getAlwaysAllowedTools() {
+    try {
+      const raw = localStorage.getItem(CONFIG.STORAGE_KEYS.APPROVED_TOOLS);
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed.filter((x) => typeof x === 'string' && x) : [];
+    } catch (e) {
+      return [];
+    }
+  },
+
+  setAlwaysAllowedTools(list) {
+    const cleaned = Array.from(new Set((list || []).filter((x) => typeof x === 'string' && x)));
+    localStorage.setItem(CONFIG.STORAGE_KEYS.APPROVED_TOOLS, JSON.stringify(cleaned));
+    UI.refreshAlwaysAllowedToolsList?.();
+  },
+
+  addAlwaysAllowedTool(toolKey) {
+    if (!toolKey) return;
+    const list = this.getAlwaysAllowedTools();
+    if (!list.includes(toolKey)) {
+      list.push(toolKey);
+      this.setAlwaysAllowedTools(list);
+    }
+  },
+
+  removeAlwaysAllowedTool(toolKey) {
+    this.setAlwaysAllowedTools(this.getAlwaysAllowedTools().filter((x) => x !== toolKey));
+  },
+
+  // Shape used by API.streamResponse to attach the user's approval
+  // preferences to every chat-stream request body.
+  getApprovalRequestPayload() {
+    return {
+      permission_mode: this.getApprovalMode(),
+      allowed_tools: this.getAlwaysAllowedTools(),
+    };
+  },
+
   async handleToolApprovalDecision(approvalId, decision) {
     if (!approvalId || (decision !== 'approve' && decision !== 'deny')) return;
     const card = document.querySelector(
       `.tool-approval-card[data-approval-id="${CSS.escape(String(approvalId))}"]`
     );
     if (card && card.dataset.status !== 'pending') return;
+
+    // "Don't ask again" — if checked, persist the tool key to the always-allow
+    // list before sending the decision so the next turn auto-allows it.
+    let rememberedKey = null;
     if (card) {
+      const remember = card.querySelector('.tool-approval-card__remember-input');
+      const toolKey = card.dataset.toolKey;
+      if (remember && remember.checked && toolKey && decision === 'approve') {
+        rememberedKey = toolKey;
+        this.addAlwaysAllowedTool(toolKey);
+      }
       card.dataset.status = 'deciding';
       card.querySelectorAll('.tool-approval-card__btn').forEach((b) => { b.disabled = true; });
     }
@@ -5119,6 +5323,7 @@ const Chat = {
     } catch (e) {
       UI.updateToolApprovalCard(approvalId, { status: 'pending' });
       UI.showToast(`Failed to ${decision} tool: ${e?.message || 'unknown error'}`);
+      if (rememberedKey) this.removeAlwaysAllowedTool(rememberedKey);
       return;
     }
 

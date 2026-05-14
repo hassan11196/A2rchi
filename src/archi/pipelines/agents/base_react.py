@@ -72,6 +72,19 @@ class BaseReActAgent:
         # so tool wrappers know which user/conversation triggered the call.
         self._current_user_id: Optional[str] = None
         self._current_conversation_id: Optional[int] = None
+        # Permission mode for the MCP guardrail. Mirrors the Claude Agent SDK
+        # values so the surface API is familiar:
+        #   "default"           — prompt for write/execute (DB-backed approval).
+        #   "acceptEdits"       — auto-approve write, still prompt for execute.
+        #   "bypassPermissions" — auto-approve everything classified as write/execute.
+        #   "plan"              — auto-deny write/execute (read-only mode).
+        # https://docs.claude.com/en/api/agent-sdk/permissions
+        self._current_permission_mode: str = "default"
+        # Per-tool always-allow list. Keys are "server:tool" (or just "tool" if
+        # the server is unknown). Mirrors Claude Code's "Yes, don't ask again"
+        # rule persistence — once the user clicks it in the UI, the frontend
+        # ships the tool key here on every subsequent stream request.
+        self._current_allowed_tools: set = set()
         # Hook for surfaces to be notified when a pending approval is created.
         # Signature: callable(approval_dict). Set externally (e.g. by the chat
         # streamer) so the SSE loop can emit a tool_approval_request event.
@@ -1359,6 +1372,45 @@ class BaseReActAgent:
         if is_auto_approved(classification, self._current_user_id):
             return None
 
+        # Per-tool always-allow list ("Yes, don't ask again" rules from the UI).
+        # We match on both "server:tool" and bare "tool" so the user can pin
+        # either granularity from the frontend.
+        sensitivity = classification.sensitivity
+        tool_key_qualified = f"{server_name}:{tool_name}" if server_name else tool_name
+        if (
+            tool_key_qualified in self._current_allowed_tools
+            or tool_name in self._current_allowed_tools
+        ):
+            logger.info(
+                "MCP guardrail: %s allowed by user always-allow rule.", tool_key_qualified,
+            )
+            return None
+
+        # Permission-mode short-circuits — no DB row, no SSE event, no
+        # waiting. The mode is chosen by the user in Settings > Permissions
+        # and shipped with every stream request.
+        mode = self._current_permission_mode
+        if mode == "bypassPermissions":
+            logger.info(
+                "MCP guardrail: %s auto-allowed (mode=bypassPermissions).", tool_name,
+            )
+            return None
+        if mode == "acceptEdits" and sensitivity == "write":
+            logger.info(
+                "MCP guardrail: %s auto-allowed (mode=acceptEdits, write).", tool_name,
+            )
+            return None
+        if mode == "plan" and sensitivity in ("write", "execute"):
+            logger.info(
+                "MCP guardrail: %s auto-denied (mode=plan, sensitivity=%s).",
+                tool_name, sensitivity,
+            )
+            return (
+                f"Tool {tool_name!r} (sensitivity={sensitivity}) is blocked: "
+                "the conversation is in plan mode (read-only). Tell the user "
+                "what you would do and ask them to switch out of plan mode."
+            )
+
         service = self._get_tool_approval_service()
         if service is None:
             logger.warning(
@@ -1502,6 +1554,23 @@ class BaseReActAgent:
         except (TypeError, ValueError):
             self._current_conversation_id = None
         self._approval_notifier = kwargs.get("approval_notifier") or self._approval_notifier
+
+        # Permission mode (default / acceptEdits / bypassPermissions / plan).
+        # Unknown values fall back to "default" rather than erroring so an
+        # outdated client cannot accidentally widen the gate.
+        raw_mode = kwargs.get("permission_mode") or "default"
+        if raw_mode not in {"default", "acceptEdits", "bypassPermissions", "plan"}:
+            logger.warning(
+                "Unknown permission_mode=%r; falling back to 'default'.", raw_mode,
+            )
+            raw_mode = "default"
+        self._current_permission_mode = raw_mode
+
+        raw_allow = kwargs.get("allowed_tools") or []
+        if isinstance(raw_allow, (list, tuple, set)):
+            self._current_allowed_tools = {str(x) for x in raw_allow if x}
+        else:
+            self._current_allowed_tools = set()
         self.refresh_agent(extra_tools=extra_tools, user_id=user_id)
 
         inputs = self._prepare_inputs(history=kwargs.get("history"))
