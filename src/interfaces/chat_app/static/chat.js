@@ -55,6 +55,7 @@ const CONFIG = {
     LIKE: '/api/like',
     DISLIKE: '/api/dislike',
     TEXT_FEEDBACK: '/api/text_feedback',
+    TOOL_APPROVALS: '/api/tool-approvals',
   },
   STREAMING: {
     TIMEOUT: 600000, // 10 minutes
@@ -575,6 +576,17 @@ const API = {
         feedback_msg: text,
       }),
     });
+  },
+
+  async decideToolApproval(approvalId, decision) {
+    return this.fetchJson(
+      `${CONFIG.ENDPOINTS.TOOL_APPROVALS}/${encodeURIComponent(approvalId)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision }),
+      }
+    );
   },
 };
 
@@ -3226,6 +3238,115 @@ const UI = {
   },
 
   // =========================================================================
+  // MCP Tool Approval Card
+  // =========================================================================
+
+  renderToolApprovalRequest(messageId, event) {
+    if (!event || !event.approval_id) return;
+
+    // Approval must surface even when trace UI is hidden / collapsed.
+    this.createTraceContainer(messageId);
+    const trace = document.querySelector(`.trace-container[data-message-id="${messageId}"]`);
+    if (!trace) return;
+    if (trace.classList.contains('collapsed')) {
+      trace.classList.remove('collapsed');
+      const ti = trace.querySelector('.toggle-icon');
+      if (ti) ti.innerHTML = '&#9660;';
+    }
+
+    const timeline = trace.querySelector('.step-timeline');
+    if (!timeline) return;
+
+    const approvalId = String(event.approval_id);
+    const existing = timeline.querySelector(
+      `.tool-approval-card[data-approval-id="${CSS.escape(approvalId)}"]`
+    );
+    if (existing) {
+      // Re-fire on retry: just re-enable buttons if still pending.
+      if (existing.dataset.status !== 'pending') {
+        this.updateToolApprovalCard(approvalId, { status: 'pending' });
+      }
+      return;
+    }
+
+    const sensitivity = (event.sensitivity || 'write').toLowerCase();
+    const toolName = event.tool_name || 'tool';
+    const serverName = event.server_name || '';
+    const argsText = this.formatToolArgs(event.tool_args);
+    const idAttr = Utils.escapeAttr(approvalId);
+
+    const html = `
+      <div class="step approval-step" data-step-id="approval-${idAttr}" data-approval-id="${idAttr}">
+        <div class="step-connector">
+          <span class="step-marker approval-marker" aria-hidden="true">!</span>
+          <div class="step-line"></div>
+        </div>
+        <div class="step-content">
+          <div class="tool-approval-card" data-approval-id="${idAttr}" data-status="pending" role="group" aria-label="Tool approval required">
+            <div class="tool-approval-card__header">
+              <div class="tool-approval-card__titles">
+                <div class="tool-approval-card__title">
+                  Approve <code>${Utils.escapeHtml(toolName)}</code>?
+                </div>
+                <div class="tool-approval-card__meta">
+                  ${serverName ? `<span class="tool-approval-card__server">${Utils.escapeHtml(serverName)}</span>` : ''}
+                  <span class="tool-approval-card__sensitivity tool-approval-card__sensitivity--${Utils.escapeAttr(sensitivity)}">${Utils.escapeHtml(sensitivity)}</span>
+                </div>
+              </div>
+            </div>
+            <details class="tool-approval-card__args">
+              <summary>Arguments</summary>
+              <pre><code>${Utils.escapeHtml(argsText)}</code></pre>
+            </details>
+            <div class="tool-approval-card__actions">
+              <button type="button"
+                      class="tool-approval-card__btn tool-approval-card__btn--deny"
+                      onclick="Chat.handleToolApprovalDecision('${idAttr}', 'deny')">Deny</button>
+              <button type="button"
+                      class="tool-approval-card__btn tool-approval-card__btn--approve"
+                      onclick="Chat.handleToolApprovalDecision('${idAttr}', 'approve')">Approve</button>
+            </div>
+            <div class="tool-approval-card__status" hidden></div>
+          </div>
+        </div>
+      </div>`;
+    timeline.insertAdjacentHTML('beforeend', html);
+    this.scrollToBottom();
+  },
+
+  updateToolApprovalCard(approvalId, { status, decidedBy = null, error = null } = {}) {
+    const card = document.querySelector(
+      `.tool-approval-card[data-approval-id="${CSS.escape(String(approvalId))}"]`
+    );
+    if (!card) return;
+    card.dataset.status = status;
+    const buttons = card.querySelectorAll('.tool-approval-card__btn');
+    const statusEl = card.querySelector('.tool-approval-card__status');
+
+    if (status === 'pending') {
+      buttons.forEach((b) => { b.disabled = false; });
+      if (statusEl) {
+        statusEl.hidden = true;
+        statusEl.textContent = '';
+      }
+      return;
+    }
+
+    buttons.forEach((b) => { b.disabled = true; });
+    if (!statusEl) return;
+
+    let msg;
+    if (status === 'approved') msg = decidedBy ? `Approved by ${decidedBy}.` : 'Approved.';
+    else if (status === 'denied') msg = decidedBy ? `Denied by ${decidedBy}.` : 'Denied.';
+    else if (status === 'expired') msg = 'Approval request expired.';
+    else if (status === 'error') msg = error || 'Could not record decision.';
+    else msg = status;
+
+    statusEl.textContent = msg;
+    statusEl.hidden = false;
+  },
+
+  // =========================================================================
   // Context Meter
   // =========================================================================
 
@@ -4729,6 +4850,12 @@ const Chat = {
    * tool/thinking rendering logic is defined in exactly one place.
    */
   _renderStreamEvent(messageId, event) {
+    // Approval requests must always render — they block the agent
+    // and require user action regardless of the trace visibility setting.
+    if (event.type === 'tool_approval_request') {
+      UI.renderToolApprovalRequest(messageId, event);
+      return;
+    }
     const showTrace = UI.isTraceVisibleMode(UI.getTraceModeForMessage(messageId));
     if (!showTrace) return;
     switch (event.type) {
@@ -4826,6 +4953,9 @@ const Chat = {
           this.state.activeTrace.events.push(event);
           this._renderStreamEvent(messageId, event);
         } else if (event.type === 'thinking_start' || event.type === 'thinking_end') {
+          this.state.activeTrace.events.push(event);
+          this._renderStreamEvent(messageId, event);
+        } else if (event.type === 'tool_approval_request') {
           this.state.activeTrace.events.push(event);
           this._renderStreamEvent(messageId, event);
         } else if (event.type === 'chunk') {
@@ -4966,6 +5096,28 @@ const Chat = {
     if (['minimal', 'normal', 'verbose'].includes(mode)) {
       this.state.traceVerboseMode = mode;
       localStorage.setItem(CONFIG.STORAGE_KEYS.TRACE_VERBOSE_MODE, mode);
+    }
+  },
+
+  async handleToolApprovalDecision(approvalId, decision) {
+    if (!approvalId || (decision !== 'approve' && decision !== 'deny')) return;
+    const card = document.querySelector(
+      `.tool-approval-card[data-approval-id="${CSS.escape(String(approvalId))}"]`
+    );
+    if (card && card.dataset.status !== 'pending') return;
+    if (card) {
+      card.dataset.status = 'deciding';
+      card.querySelectorAll('.tool-approval-card__btn').forEach((b) => { b.disabled = true; });
+    }
+    try {
+      const result = await API.decideToolApproval(approvalId, decision);
+      UI.updateToolApprovalCard(approvalId, {
+        status: result?.status || (decision === 'approve' ? 'approved' : 'denied'),
+        decidedBy: result?.decided_by || 'you',
+      });
+    } catch (e) {
+      UI.updateToolApprovalCard(approvalId, { status: 'pending' });
+      UI.showToast(`Failed to ${decision} tool: ${e?.message || 'unknown error'}`);
     }
   },
 };
