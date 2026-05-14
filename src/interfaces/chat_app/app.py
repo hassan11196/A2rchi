@@ -2166,6 +2166,8 @@ class ChatWrapper:
         model: str = None,
         provider_api_key: str = None,
         user_id: Optional[str] = None,
+        permission_mode: str = "default",
+        allowed_tools: Optional[List[str]] = None,
     ) -> Iterator[Dict[str, Any]]:
         timestamps = self._init_timestamps()
         context = None
@@ -2244,7 +2246,15 @@ class ChatWrapper:
                     **payload,
                 })
 
-            for output in self.archi.stream(history=context.history, conversation_id=context.conversation_id, user_id=user_id, model=context.model_used, approval_notifier=_approval_notifier):
+            for output in self.archi.stream(
+                history=context.history,
+                conversation_id=context.conversation_id,
+                user_id=user_id,
+                model=context.model_used,
+                approval_notifier=_approval_notifier,
+                permission_mode=permission_mode,
+                allowed_tools=allowed_tools or [],
+            ):
                 while pending_approval_events:
                     yield pending_approval_events.pop(0)
                 if client_timeout and time.time() - stream_start_time > client_timeout:
@@ -4923,6 +4933,15 @@ class FlaskAppWrapper(object):
         if isinstance(include_tool_steps, str):
             include_tool_steps = include_tool_steps.lower() == "true"
 
+        # MCP tool-approval mode and per-tool always-allow rules. Mirrors
+        # Claude Agent SDK's permission_mode + Claude Code's
+        # permissions.allow. Validation happens in the guardrail itself; the
+        # parser just normalizes shape (list of strings).
+        raw_allowed = payload.get("allowed_tools") or []
+        if not isinstance(raw_allowed, (list, tuple)):
+            raw_allowed = []
+        allowed_tools = [str(x) for x in raw_allowed if x]
+
         return {
             "message": payload.get("last_message"),
             "conversation_id": payload.get("conversation_id"),
@@ -4937,6 +4956,8 @@ class FlaskAppWrapper(object):
             "provider": payload.get("provider"),
             "model": payload.get("model"),
             "pipeline": payload.get("pipeline"),
+            "permission_mode": payload.get("permission_mode") or "default",
+            "allowed_tools": allowed_tools,
         }
 
 
@@ -5032,6 +5053,8 @@ class FlaskAppWrapper(object):
         include_tool_steps = request_data["include_tool_steps"]
         provider = request_data["provider"]
         model = request_data["model"]
+        permission_mode = request_data["permission_mode"]
+        allowed_tools = request_data["allowed_tools"]
 
         if not client_id:
             return jsonify({"error": "client_id missing"}), 400
@@ -5061,6 +5084,8 @@ class FlaskAppWrapper(object):
                 model=model,
                 provider_api_key=session_api_key,
                 user_id=user_id,
+                permission_mode=permission_mode,
+                allowed_tools=allowed_tools,
             ):
                 yield json.dumps(event, default=str) + "\n"
 
