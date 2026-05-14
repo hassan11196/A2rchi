@@ -673,6 +673,28 @@ CREATE TABLE IF NOT EXISTS ab_variant_metrics (
 );
 
 -- ============================================================================
+-- 8.1 USER ACTIONS (write-operation audit timeline)
+-- ============================================================================
+-- Single source of truth for "what has been done for/by a user" — settings
+-- changes, API-key edits, document uploads, tool approvals, agent edits.
+
+CREATE TABLE IF NOT EXISTS user_actions (
+    action_id   VARCHAR(64) PRIMARY KEY,
+    user_id     VARCHAR(200),
+    action_type VARCHAR(100) NOT NULL,
+    target_kind VARCHAR(100),
+    target_id   VARCHAR(200),
+    payload     JSONB NOT NULL DEFAULT '{}'::jsonb,
+    source      VARCHAR(20) NOT NULL DEFAULT 'web',
+    ts          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_actions_user_ts
+    ON user_actions (user_id, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_user_actions_type_ts
+    ON user_actions (action_type, ts DESC);
+
+-- ============================================================================
 -- 9. MIGRATION STATE (for resumable migrations)
 -- ============================================================================
 
