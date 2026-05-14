@@ -108,11 +108,12 @@
 
     <!-- Input -->
     <footer class="input-area">
-      <!-- Pending MCP tool approvals appear here, directly above the input,
-           so the user notices and acts on them in-flow. The tray is hidden
-           by default and revealed when a tool_approval_request event lands. -->
-      <div class="approval-tray" hidden aria-live="polite" aria-label="Pending tool approvals"></div>
       <div class="input-container">
+        <!-- Pending MCP tool approvals appear here, directly above the input
+             field. Lives INSIDE .input-container so it shares the same
+             centered max-width and the column flex direction — otherwise it
+             becomes a side-by-side flex sibling of the input wrapper. -->
+        <div class="approval-tray" hidden aria-live="polite" aria-label="Pending tool approvals"></div>
         <div class="input-wrapper">
           <div class="input-left-controls">
             
