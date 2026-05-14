@@ -2505,6 +2505,10 @@ class FlaskAppWrapper(object):
         # create the chat from the wrapper and ensure default config is active
         self.chat = ChatWrapper()
         self.chat.update_config(config_name=self.config["name"])
+        # Expose the chat wrapper on the Flask app so the API blueprint can
+        # reach it through current_app without us having to refactor it into
+        # a fully shared service.
+        self.app.chat_wrapper = self.chat
 
         # enable CORS:
         CORS(self.app)
