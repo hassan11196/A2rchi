@@ -1373,14 +1373,42 @@ class BaseReActAgent:
         classification = classify_tool(tool_name, tool_description, server_cfg)
         if not classification.requires_approval:
             return None
+
+        # Resolve service up-front so we can audit-log even the auto-resolved
+        # short-circuits below. Auditing is best-effort — a failed write
+        # never blocks the actual tool decision.
+        service = self._get_tool_approval_service()
+        sensitivity = classification.sensitivity
+        tool_key_qualified = f"{server_name}:{tool_name}" if server_name else tool_name
+
+        def _audit(status: str, reason: str) -> None:
+            if service is None:
+                return
+            try:
+                service.record_resolved(
+                    conversation_id=self._current_conversation_id,
+                    message_id=None,
+                    user_id=self._current_user_id,
+                    server_name=server_name or "",
+                    tool_name=tool_name,
+                    tool_args=tool_args or {},
+                    sensitivity=sensitivity,
+                    status=status,
+                    decided_by=reason,
+                    source="chat",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "MCP guardrail: audit record failed for %s: %s", tool_name, exc,
+                )
+
         if is_auto_approved(classification, self._current_user_id):
+            _audit("approved", "auto:principal-allow")
             return None
 
         # Per-tool always-allow list ("Yes, don't ask again" rules from the UI).
         # We match on both "server:tool" and bare "tool" so the user can pin
         # either granularity from the frontend.
-        sensitivity = classification.sensitivity
-        tool_key_qualified = f"{server_name}:{tool_name}" if server_name else tool_name
         if (
             tool_key_qualified in self._current_allowed_tools
             or tool_name in self._current_allowed_tools
@@ -1388,34 +1416,37 @@ class BaseReActAgent:
             logger.info(
                 "MCP guardrail: %s allowed by user always-allow rule.", tool_key_qualified,
             )
+            _audit("approved", "auto:always-allow")
             return None
 
-        # Permission-mode short-circuits — no DB row, no SSE event, no
-        # waiting. The mode is chosen by the user in Settings > Permissions
-        # and shipped with every stream request.
+        # Permission-mode short-circuits — no SSE event, no waiting. Still
+        # logged for the audit trail. The mode is chosen by the user in
+        # Settings > Permissions and shipped with every stream request.
         mode = self._current_permission_mode
         if mode == "bypassPermissions":
             logger.info(
                 "MCP guardrail: %s auto-allowed (mode=bypassPermissions).", tool_name,
             )
+            _audit("approved", "auto:bypassPermissions")
             return None
         if mode == "acceptEdits" and sensitivity == "write":
             logger.info(
                 "MCP guardrail: %s auto-allowed (mode=acceptEdits, write).", tool_name,
             )
+            _audit("approved", "auto:acceptEdits")
             return None
         if mode == "plan" and sensitivity in ("write", "execute"):
             logger.info(
                 "MCP guardrail: %s auto-denied (mode=plan, sensitivity=%s).",
                 tool_name, sensitivity,
             )
+            _audit("denied", "auto:plan")
             return (
                 f"Tool {tool_name!r} (sensitivity={sensitivity}) is blocked: "
                 "the conversation is in plan mode (read-only). Tell the user "
                 "what you would do and ask them to switch out of plan mode."
             )
 
-        service = self._get_tool_approval_service()
         if service is None:
             logger.warning(
                 "MCP guardrail: tool %s (sensitivity=%s) would require "

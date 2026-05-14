@@ -601,6 +601,13 @@ const API = {
       }
     );
   },
+
+  async listToolApprovals({ status = null, limit = 100 } = {}) {
+    const params = new URLSearchParams();
+    params.set('limit', String(limit));
+    if (status) params.set('status', status);
+    return this.fetchJson(`${CONFIG.ENDPOINTS.TOOL_APPROVALS}?${params.toString()}`);
+  },
 };
 
 // =============================================================================
@@ -1025,6 +1032,15 @@ const UI = {
       if (removeBtn) {
         Chat.removeAlwaysAllowedTool(removeBtn.dataset.allowedTool);
       }
+      const refreshBtn = e.target.closest && e.target.closest('[data-approval-history-refresh]');
+      if (refreshBtn) {
+        UI.refreshApprovalHistory();
+      }
+    });
+    document.addEventListener('change', (e) => {
+      if (e.target && e.target.matches && e.target.matches('[data-approval-history-status]')) {
+        UI.refreshApprovalHistory();
+      }
     });
 
     this.elements.darkModeToggle?.addEventListener('change', (e) => {
@@ -1137,6 +1153,7 @@ const UI = {
     if (sectionId === 'permissions') {
       this.refreshApprovalModeIndicator();
       this.refreshAlwaysAllowedToolsList();
+      this.refreshApprovalHistory();
     }
   },
 
@@ -3525,6 +3542,71 @@ const UI = {
                     data-allowed-tool="${Utils.escapeAttr(t)}" aria-label="Remove ${Utils.escapeAttr(t)}">&#10005;</button>
           </li>`).join('')}
       </ul>`;
+  },
+
+  async refreshApprovalHistory() {
+    const container = document.querySelector('[data-approval-history-list]');
+    if (!container) return;
+    const statusSel = document.querySelector('[data-approval-history-status]');
+    const status = statusSel ? (statusSel.value || null) : null;
+    container.innerHTML = '<p class="settings-description">Loading…</p>';
+    try {
+      const data = await API.listToolApprovals({ status, limit: 100 });
+      const rows = Array.isArray(data?.approvals) ? data.approvals : [];
+      if (!rows.length) {
+        container.innerHTML = '<p class="settings-description">No history yet.</p>';
+        return;
+      }
+      container.innerHTML = `
+        <table class="approval-history">
+          <thead>
+            <tr>
+              <th>When</th>
+              <th>Tool</th>
+              <th>Severity</th>
+              <th>Status</th>
+              <th>Decided by</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows.map((r) => this._renderApprovalHistoryRow(r)).join('')}
+          </tbody>
+        </table>`;
+    } catch (e) {
+      container.innerHTML = `<p class="settings-description settings-description--error">Failed to load history: ${Utils.escapeHtml(e?.message || 'unknown error')}</p>`;
+    }
+  },
+
+  _renderApprovalHistoryRow(r) {
+    const when = this._formatApprovalWhen(r.decided_at || r.requested_at);
+    const sev = (r.sensitivity || '').toLowerCase();
+    const status = (r.status || '').toLowerCase();
+    const decidedBy = r.decided_by || '—';
+    const toolLabel = r.server_name
+      ? `<code>${Utils.escapeHtml(r.server_name)}:${Utils.escapeHtml(r.tool_name)}</code>`
+      : `<code>${Utils.escapeHtml(r.tool_name || 'tool')}</code>`;
+    return `
+      <tr class="approval-history__row" data-status="${Utils.escapeAttr(status)}">
+        <td class="approval-history__when" title="${Utils.escapeAttr(r.decided_at || r.requested_at || '')}">${Utils.escapeHtml(when)}</td>
+        <td class="approval-history__tool">${toolLabel}</td>
+        <td><span class="approval-history__sev approval-history__sev--${Utils.escapeAttr(sev)}">${Utils.escapeHtml(sev || '—')}</span></td>
+        <td><span class="approval-history__status approval-history__status--${Utils.escapeAttr(status)}">${Utils.escapeHtml(status)}</span></td>
+        <td class="approval-history__by">${Utils.escapeHtml(decidedBy)}</td>
+      </tr>`;
+  },
+
+  _formatApprovalWhen(iso) {
+    if (!iso) return '—';
+    const ts = Date.parse(iso);
+    if (Number.isNaN(ts)) return iso;
+    const diff = Date.now() - ts;
+    const abs = Math.abs(diff);
+    const min = 60_000, hr = 3_600_000, day = 86_400_000;
+    if (abs < min) return 'just now';
+    if (abs < hr) return `${Math.round(abs / min)}m ago`;
+    if (abs < day) return `${Math.round(abs / hr)}h ago`;
+    if (abs < 7 * day) return `${Math.round(abs / day)}d ago`;
+    return new Date(ts).toLocaleString();
   },
 
   // =========================================================================

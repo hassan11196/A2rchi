@@ -20,7 +20,7 @@ import json
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import psycopg2
 
@@ -296,6 +296,132 @@ class ToolApprovalService:
         if not row:
             return None
         return self.get(approval_id)
+
+    def record_resolved(
+        self,
+        *,
+        conversation_id: Optional[int],
+        message_id: Optional[int],
+        user_id: Optional[str],
+        server_name: str,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+        sensitivity: str,
+        status: ApprovalStatus,
+        decided_by: str,
+        source: str = "auto",
+        ttl: Optional[timedelta] = None,
+    ) -> ToolApproval:
+        """Insert a row that's already decided.
+
+        Used when the guardrail short-circuits a write/execute tool call
+        without an interactive prompt — e.g. ``acceptEdits`` /
+        ``bypassPermissions`` / always-allow list / ``plan`` denial. The
+        row is created with the terminal status (``approved`` or
+        ``denied``) and ``decided_by`` should describe *why* it was
+        decided automatically (e.g. ``"auto:bypassPermissions"``,
+        ``"auto:always-allow"``, ``"auto:plan-denied"``). Required for the
+        audit history view to show non-interactive decisions.
+        """
+        if status not in ("approved", "denied"):
+            raise ValueError(f"record_resolved expects approved|denied, got {status!r}")
+        approval_id = secrets.token_hex(16)
+        now = datetime.now(timezone.utc)
+        expires_at = now + (ttl or self._default_ttl)
+        args_hash = hash_tool_args(tool_args)
+        payload = json.dumps(tool_args or {})
+
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO tool_approvals (
+                        approval_id, conversation_id, message_id, user_id,
+                        server_name, tool_name, tool_args, args_hash,
+                        sensitivity, status, requested_at, decided_at,
+                        decided_by, expires_at, source
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s,
+                            %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        approval_id, conversation_id, message_id, user_id,
+                        server_name, tool_name, payload, args_hash,
+                        sensitivity, status, now, now,
+                        decided_by, expires_at, source,
+                    ),
+                )
+            conn.commit()
+        finally:
+            self._release_connection(conn)
+
+        return ToolApproval(
+            approval_id=approval_id,
+            conversation_id=conversation_id,
+            message_id=message_id,
+            user_id=user_id,
+            server_name=server_name,
+            tool_name=tool_name,
+            tool_args=tool_args,
+            args_hash=args_hash,
+            sensitivity=sensitivity,
+            status=status,
+            requested_at=now,
+            decided_at=now,
+            decided_by=decided_by,
+            expires_at=expires_at,
+            source=source,
+        )
+
+    def list_recent(
+        self,
+        *,
+        user_id: Optional[str] = None,
+        conversation_id: Optional[int] = None,
+        status: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[ToolApproval]:
+        """Recent approvals (most-recent-first), optionally filtered.
+
+        Powers the "Approval history" view in Settings. Keep the result
+        bounded (default 100 rows) so a long-running user doesn't pull
+        thousands of rows down the wire.
+        """
+        limit = max(1, min(int(limit or 100), 500))
+        clauses: List[str] = []
+        params: List[Any] = []
+        if user_id is not None:
+            clauses.append("user_id = %s")
+            params.append(user_id)
+        if conversation_id is not None:
+            clauses.append("conversation_id = %s")
+            params.append(conversation_id)
+        if status:
+            clauses.append("status = %s")
+            params.append(status)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT approval_id, conversation_id, message_id, user_id, server_name,
+                           tool_name, tool_args, args_hash, sensitivity, status,
+                           requested_at, decided_at, decided_by, expires_at, source
+                    FROM tool_approvals
+                    {where}
+                    ORDER BY requested_at DESC
+                    LIMIT %s
+                    """,
+                    tuple(params),
+                )
+                rows = cur.fetchall() or []
+        finally:
+            self._release_connection(conn)
+        return [_row_to_approval(r) for r in rows]
 
     def expire_stale(self) -> int:
         """Mark every overdue pending row as ``expired``.  Returns the count."""
