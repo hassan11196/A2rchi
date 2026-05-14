@@ -460,7 +460,10 @@ class TestServiceIntegration:
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
         
+        # Services moved to get_connection_direct() — keep both bound so the
+        # mock matches whichever variant a service ends up calling.
         mock_pool.get_connection.return_value = mock_conn
+        mock_pool.get_connection_direct.return_value = mock_conn
         mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
         mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
         mock_pool_class.return_value = mock_pool
