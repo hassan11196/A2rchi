@@ -388,6 +388,25 @@
                 <p class="settings-description">Tools you've pinned with "Don't ask again". The backend treats them as pre-approved on every turn.</p>
                 <div data-allowed-tools-list></div>
               </div>
+
+              <div class="settings-group settings-group-bordered">
+                <div class="settings-group-header">
+                  <span class="settings-label">Approval history</span>
+                  <button type="button" class="settings-link-btn" data-approval-history-refresh>Refresh</button>
+                </div>
+                <p class="settings-description">Every write/execute tool call this account has run, with how it was decided — explicit Approve/Deny, the active permission mode, or an always-allow rule.</p>
+                <div class="approval-history-filter">
+                  <label for="approval-history-status">Filter</label>
+                  <select id="approval-history-status" data-approval-history-status>
+                    <option value="">All</option>
+                    <option value="approved">Approved</option>
+                    <option value="denied">Denied</option>
+                    <option value="pending">Pending</option>
+                    <option value="expired">Expired</option>
+                  </select>
+                </div>
+                <div data-approval-history-list></div>
+              </div>
             </section>
 
             <!-- Display Section -->

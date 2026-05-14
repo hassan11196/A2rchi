@@ -1098,6 +1098,54 @@ def get_api_info():
 # MCP tool approvals (Claude-style write/execute gate)
 # ---------------------------------------------------------------------------
 
+@api.route('/tool-approvals', methods=['GET'])
+@require_client_id
+def list_tool_approvals():
+    """Recent approval history for the calling user.
+
+    Query params:
+      ``limit``   max rows to return (clamped 1..500, default 100)
+      ``status``  optional filter: ``approved`` | ``denied`` | ``pending``
+                  | ``expired``
+      ``conversation_id`` optional filter
+
+    Powers the "Approval history" view in Settings > Permissions. Scoped
+    to the calling user — admin-style cross-user views would need an
+    explicit elevated role and are out of scope here.
+    """
+    try:
+        limit_raw = request.args.get('limit', '100')
+        try:
+            limit = int(limit_raw)
+        except (TypeError, ValueError):
+            limit = 100
+        status_filter = (request.args.get('status') or '').strip().lower() or None
+        if status_filter and status_filter not in (
+            'approved', 'denied', 'pending', 'expired'
+        ):
+            return jsonify({'error': 'invalid_status'}), 400
+
+        conv_raw = request.args.get('conversation_id')
+        conv_id = None
+        if conv_raw:
+            try:
+                conv_id = int(conv_raw)
+            except (TypeError, ValueError):
+                return jsonify({'error': 'invalid_conversation_id'}), 400
+
+        services = get_services()
+        rows = services.tool_approval_service.list_recent(
+            user_id=g.get('client_id') or None,
+            conversation_id=conv_id,
+            status=status_filter,
+            limit=limit,
+        )
+        return jsonify({'approvals': [_serialize_approval(r) for r in rows]}), 200
+    except Exception as exc:
+        logger.error("Error listing tool approvals: %s", exc)
+        return jsonify({'error': str(exc)}), 500
+
+
 @api.route('/tool-approvals/<approval_id>', methods=['GET'])
 @require_client_id
 def get_tool_approval(approval_id: str):

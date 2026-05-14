@@ -4010,6 +4010,123 @@ body {
   color: var(--error-text);
 }
 
+/* Approval history table — every gated tool decision, regardless of how
+   it was resolved (explicit / acceptEdits / bypassPermissions /
+   always-allow / plan denial). */
+.approval-history-filter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.approval-history-filter select {
+  font-size: 12px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+}
+
+.approval-history {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.approval-history th {
+  text-align: left;
+  font-weight: 500;
+  color: var(--text-secondary);
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border-color);
+  position: sticky;
+  top: 0;
+  background: var(--bg-primary);
+}
+
+.approval-history td {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border-color);
+  vertical-align: middle;
+}
+
+.approval-history__row:hover {
+  background: var(--bg-hover);
+}
+
+.approval-history__when {
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.approval-history__tool code {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11px;
+}
+
+.approval-history__by {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.approval-history__sev {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 600;
+  background: var(--bg-hover);
+  color: var(--text-secondary);
+}
+
+.approval-history__sev--write {
+  background: var(--warning-color, #ca8a04);
+  color: #fff;
+}
+
+.approval-history__sev--execute {
+  background: var(--error-text, #b91c1c);
+  color: #fff;
+}
+
+.approval-history__status {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 600;
+}
+
+.approval-history__status--approved {
+  background: var(--accent-light);
+  color: var(--accent);
+}
+
+.approval-history__status--denied,
+.approval-history__status--expired {
+  background: var(--bg-hover);
+  color: var(--text-secondary);
+}
+
+.approval-history__status--pending {
+  background: rgba(202, 138, 4, 0.16);
+  color: var(--warning-color, #ca8a04);
+}
+
+.settings-description--error {
+  color: var(--error-text);
+}
+
 /* -----------------------------------------------------------------------------
    Cancel Button
    ----------------------------------------------------------------------------- */
