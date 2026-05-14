@@ -5159,9 +5159,12 @@ class FlaskAppWrapper(object):
 
         Query parameters:
         - limit (optional): Number of conversations to return (default: 50, max: 500)
+        - source (optional): Filter by archi_service — one of
+          ``all`` (default), ``chat``, ``mattermost``, ``api``.
 
         Returns:
-            JSON with list of conversations with fields: (conversation_id, title, created_at, last_message_at).
+            JSON with list of conversations with fields:
+            (conversation_id, title, created_at, last_message_at, archi_service).
         """
         try:
             client_id = request.args.get('client_id')
@@ -5169,6 +5172,12 @@ class FlaskAppWrapper(object):
             if not user_id and not client_id:
                 return jsonify({'error': 'client_id missing'}), 400
             limit = min(int(request.args.get('limit', 50)), 500)
+            source_filter = (request.args.get('source') or 'all').strip().lower()
+            if source_filter not in {'all', 'chat', 'mattermost', 'api'}:
+                return jsonify({
+                    'error': "Invalid 'source' query parameter; expected one of "
+                             "'all', 'chat', 'mattermost', 'api'."
+                }), 400
 
             # create connection to database
             conn = psycopg2.connect(**self.pg_config)
@@ -5184,12 +5193,15 @@ class FlaskAppWrapper(object):
 
             conversations = []
             for row in rows:
+                archi_service = row[4] if len(row) > 4 else 'chat'
+                if source_filter != 'all' and archi_service != source_filter:
+                    continue
                 conversations.append({
                     'conversation_id': row[0],
                     'title': row[1] or "New Chat",
                     'created_at': row[2].isoformat() if row[2] else None,
                     'last_message_at': row[3].isoformat() if row[3] else None,
-                    'archi_service': row[4] if len(row) > 4 else 'chat',
+                    'archi_service': archi_service,
                 })
 
             # clean up database connection state
@@ -5201,7 +5213,7 @@ class FlaskAppWrapper(object):
         except ValueError as e:
             return jsonify({'error': f'Invalid parameter: {str(e)}'}), 400
         except Exception as e:
-            print(f"ERROR in list_conversations: {str(e)}")
+            logger.error("Error in list_conversations: %s", e)
             return jsonify({'error': str(e)}), 500
 
     def load_conversation(self):
