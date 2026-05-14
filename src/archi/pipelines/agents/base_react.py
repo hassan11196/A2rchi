@@ -54,7 +54,17 @@ class BaseReActAgent:
             self.selected_tool_names = list(getattr(agent_spec, "tools", []) or [])
         self._active_memory: Optional[RunMemory] = None
         self._static_tools: Optional[List[Callable]] = None
-        self._mcp_tools: Optional[List[Callable]] = None
+        # Per-user MCP-tool cache keyed by user_id (None = anonymous). The
+        # entry is (expires_at_monotonic_seconds, tools_list).  Caching is
+        # required for correctness *and* performance: rebuilding the MCP
+        # client on every chat turn performs a full transport handshake +
+        # list_tools roundtrip against each configured server.
+        self._mcp_tools_cache: Dict[Optional[str], Tuple[float, List[Callable]]] = {}
+        # TTL is short enough that SSO access tokens (typically 1 h) remain
+        # valid for the cached window; MCPOAuthService.get_access_token
+        # silently refreshes once we rebuild.
+        self._MCP_TOOLS_TTL_SECONDS = 60.0
+        self._mcp_skills_text: str = ""
         self._active_tools: List[Callable] = []
         self._static_middleware: Optional[List[Callable]] = None
         self._active_middleware: List[Callable] = []
@@ -134,10 +144,14 @@ class BaseReActAgent:
         # Different providers use different keys
         usage = response_metadata.get("usage") or response_metadata.get("token_usage")
         if usage:
+            # OpenAI nests cache info under prompt_tokens_details.cached_tokens.
+            details = usage.get("prompt_tokens_details") or {}
+            cached_tokens = details.get("cached_tokens", 0) if isinstance(details, dict) else 0
             return {
                 "prompt_tokens": usage.get("prompt_tokens") or usage.get("input_tokens", 0),
                 "completion_tokens": usage.get("completion_tokens") or usage.get("output_tokens", 0),
                 "total_tokens": usage.get("total_tokens", 0),
+                "cached_tokens": int(cached_tokens or 0),
             }
         # Ollama format
         if "prompt_eval_count" in response_metadata or "eval_count" in response_metadata:
@@ -147,6 +161,7 @@ class BaseReActAgent:
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
                 "total_tokens": prompt_tokens + completion_tokens,
+                "cached_tokens": 0,
             }
         return None
 
@@ -179,7 +194,7 @@ class BaseReActAgent:
     def _extract_usage_from_messages(self, messages: List[BaseMessage]) -> Optional[Dict[str, int]]:
         """
         Sum token usage across ALL AI messages in the turn.
-        
+
         In a multi-step agent loop, the LLM is called multiple times
         (thinking, tool decisions, final answer). Each call reports its
         own prompt_tokens and completion_tokens. We sum them to show
@@ -187,8 +202,9 @@ class BaseReActAgent:
         """
         total_prompt = 0
         total_completion = 0
+        total_cached = 0
         found_any = False
-        
+
         for msg in messages:
             msg_type = str(getattr(msg, "type", "")).lower()
             if msg_type not in {"ai", "assistant"} and "ai" not in type(msg).__name__.lower():
@@ -197,15 +213,17 @@ class BaseReActAgent:
             if usage:
                 total_prompt += usage.get("prompt_tokens", 0)
                 total_completion += usage.get("completion_tokens", 0)
+                total_cached += usage.get("cached_tokens", 0)
                 found_any = True
-        
+
         if not found_any:
             return None
-        
+
         return {
             "prompt_tokens": total_prompt,
             "completion_tokens": total_completion,
             "total_tokens": total_prompt + total_completion,
+            "cached_tokens": total_cached,
         }
 
     def _extract_usage_from_message(self, message: BaseMessage) -> Optional[Dict[str, int]]:
@@ -215,11 +233,18 @@ class BaseReActAgent:
             prompt_tokens = usage_metadata.get("input_tokens", 0)
             completion_tokens = usage_metadata.get("output_tokens", 0)
             total_tokens = usage_metadata.get("total_tokens", prompt_tokens + completion_tokens)
+            # LangChain standardizes cache hit info under input_token_details.cache_read.
+            # OpenAI maps prompt_tokens_details.cached_tokens → cache_read here.
+            input_details = usage_metadata.get("input_token_details") or {}
+            cached_tokens = (
+                input_details.get("cache_read", 0) if isinstance(input_details, dict) else 0
+            )
             if prompt_tokens or completion_tokens or total_tokens:
                 return {
                     "prompt_tokens": int(prompt_tokens or 0),
                     "completion_tokens": int(completion_tokens or 0),
                     "total_tokens": int(total_tokens or 0),
+                    "cached_tokens": int(cached_tokens or 0),
                 }
 
         response_metadata = getattr(message, "response_metadata", None)
@@ -390,6 +415,29 @@ class BaseReActAgent:
                         content = self._message_content(message)
                         additional_kwargs = getattr(message, "additional_kwargs", None) or {}
                         reasoning_content = additional_kwargs.get("reasoning_content", "")
+
+                        # Detect empty AI chunks as implicit thinking activity.
+                        # Some LLM integrations (e.g. langchain-ollama <1.1) drop
+                        # the thinking/reasoning payload, producing chunks where
+                        # both content and reasoning_content are empty while the
+                        # model is still in its thinking phase.  We treat these as
+                        # a signal to start (or continue) the thinking indicator
+                        # so the UI stays responsive.
+                        if not content and not reasoning_content:
+                            if thinking_step_id is None and "chunk" in msg_class:
+                                thinking_step_id = str(uuid.uuid4())
+                                thinking_start_time = time.time()
+                                yield self.finalize_output(
+                                    answer="",
+                                    memory=self.active_memory,
+                                    messages=[],
+                                    metadata={
+                                        "event_type": "thinking_start",
+                                        "step_id": thinking_step_id,
+                                    },
+                                    final=False,
+                                )
+
                         if content or reasoning_content:
                             # Start thinking phase if not already active
                             if thinking_step_id is None:
@@ -538,12 +586,21 @@ class BaseReActAgent:
             usage = self._extract_usage_from_metadata(last_response_metadata)
         if model is None:
             model = self._extract_model_from_metadata(last_response_metadata)
+        if usage:
+            pt = usage.get("prompt_tokens", 0)
+            ct = usage.get("completion_tokens", 0)
+            cached = usage.get("cached_tokens", 0)
+            hit = (cached / pt * 100.0) if pt else 0.0
+            logger.info(
+                "Usage: prompt=%d (cached=%d, %.1f%% hit) completion=%d total=%d",
+                pt, cached, hit, ct, usage.get("total_tokens", pt + ct),
+            )
         final_metadata = {
             "event_type": "final",
             "usage": usage,
             "model": model,
         }
-        
+
         if final_answer:
             yield self.finalize_output(
                 answer=final_answer,
@@ -665,6 +722,23 @@ class BaseReActAgent:
                         content = self._message_content(message)
                         additional_kwargs = getattr(message, "additional_kwargs", None) or {}
                         reasoning_content = additional_kwargs.get("reasoning_content", "")
+
+                        # Detect empty AI chunks as implicit thinking activity.
+                        if not content and not reasoning_content:
+                            if thinking_step_id is None and "chunk" in msg_class:
+                                thinking_step_id = str(uuid.uuid4())
+                                thinking_start_time = time.time()
+                                yield self.finalize_output(
+                                    answer="",
+                                    memory=self.active_memory,
+                                    messages=[],
+                                    metadata={
+                                        "event_type": "thinking_start",
+                                        "step_id": thinking_step_id,
+                                    },
+                                    final=False,
+                                )
+
                         if content or reasoning_content:
                             # Start thinking phase if not already active
                             if thinking_step_id is None:
@@ -809,12 +883,21 @@ class BaseReActAgent:
             usage = self._extract_usage_from_metadata(last_response_metadata)
         if model is None:
             model = self._extract_model_from_metadata(last_response_metadata)
+        if usage:
+            pt = usage.get("prompt_tokens", 0)
+            ct = usage.get("completion_tokens", 0)
+            cached = usage.get("cached_tokens", 0)
+            hit = (cached / pt * 100.0) if pt else 0.0
+            logger.info(
+                "Usage: prompt=%d (cached=%d, %.1f%% hit) completion=%d total=%d",
+                pt, cached, hit, ct, usage.get("total_tokens", pt + ct),
+            )
         final_metadata = {
             "event_type": "final",
             "usage": usage,
             "model": model,
         }
-        
+
         if final_answer:
             yield self.finalize_output(
                 answer=final_answer,
@@ -998,19 +1081,38 @@ class BaseReActAgent:
         extra_tools: Optional[Sequence[Callable]] = None,
         middleware: Optional[Sequence[Callable]] = None,
         force: bool = False,
+        user_id: Optional[str] = None,
     ) -> CompiledStateGraph:
         """Ensure the LangGraph agent reflects the latest tool set."""
         base_tools = list(static_tools) if static_tools is not None else self.tools
-        toolset: List[Callable] = list(base_tools)
+        extra_list: List[Callable] = list(extra_tools) if extra_tools else []
 
+        mcp_tools: List[Callable] = []
         if "mcp" in self.selected_tool_names:
-            if self._mcp_tools is None:
-                built = self._build_mcp_tools()
-                self._mcp_tools = list(built or [])
-            toolset.extend(self._mcp_tools)
+            mcp_tools = list(self._get_mcp_tools_cached(user_id) or [])
 
-        if extra_tools:
-            toolset.extend(extra_tools)
+        # OpenAI enforces a hard 128-tool limit per request.  Trim only the MCP
+        # portion when we exceed it — base/extra tools are configuration-locked
+        # and must be preserved.  Tracking lists separately means the slice
+        # boundaries are unambiguous regardless of internal concatenation order.
+        _OPENAI_MAX_TOOLS = 128
+        n_protected = len(base_tools) + len(extra_list)
+        if n_protected + len(mcp_tools) > _OPENAI_MAX_TOOLS:
+            mcp_budget = max(0, _OPENAI_MAX_TOOLS - n_protected)
+            logger.warning(
+                "Toolset has %d tools (%d base + %d extra + %d MCP), exceeding "
+                "OpenAI max of %d. Truncating MCP tools to %d; base + extra "
+                "preserved.",
+                n_protected + len(mcp_tools),
+                len(base_tools),
+                len(extra_list),
+                len(mcp_tools),
+                _OPENAI_MAX_TOOLS,
+                mcp_budget,
+            )
+            mcp_tools = mcp_tools[:mcp_budget]
+
+        toolset: List[Callable] = base_tools + extra_list + mcp_tools
 
         middleware = list(middleware) if middleware is not None else self.middleware
 
@@ -1029,14 +1131,16 @@ class BaseReActAgent:
 
     def _build_system_prompt(self) -> str:
         """
-        Build the full system prompt, appending role context if enabled.
-        
+        Build the full system prompt, appending role context and MCP server skills.
+
         Role context is appended when SSO auth with auth_roles is configured
-        and pass_descriptions_to_agent is set to true.
+        and pass_descriptions_to_agent is set to true. MCP server skills are
+        appended once here rather than per-tool so long skills don't multiply
+        by the number of tools in the catalog.
         """
         base_prompt = self.agent_prompt or ""
         role_context = get_role_context()
-        return base_prompt + role_context
+        return base_prompt + role_context + (self._mcp_skills_text or "")
 
     def _create_agent(self, tools: Sequence[Callable], middleware: Sequence[Callable]) -> CompiledStateGraph:
         """Create the LangGraph agent with the specified LLM, tools, and system prompt."""
@@ -1057,20 +1161,53 @@ class BaseReActAgent:
         static_names = [name for name in selected if name != "mcp"]
         return self._select_tools_from_registry(static_names)
 
-    def _build_mcp_tools(self) -> List[Callable]:
+    def _get_mcp_tools_cached(self, user_id: Optional[str]) -> Optional[List[Callable]]:
+        """Return MCP tools for *user_id*, building once per TTL window.
+
+        Rebuilding the MCP client on every chat turn is expensive (full
+        transport handshake + list_tools roundtrip per configured server).
+        We cache per user_id since SSO-gated servers select tools based on
+        the per-user OAuth token.  The TTL is short enough that
+        ``MCPOAuthService.get_access_token`` will refresh tokens before the
+        cached header goes stale.
+        """
+        cached = self._mcp_tools_cache.get(user_id)
+        now = time.monotonic()
+        if cached is not None:
+            expires_at, tools = cached
+            if expires_at > now:
+                return tools
+
+        built = self._build_mcp_tools(user_id=user_id) or []
+        self._mcp_tools_cache[user_id] = (now + self._MCP_TOOLS_TTL_SECONDS, list(built))
+        return built
+
+    def invalidate_mcp_tools_cache(self, user_id: Optional[str] = None) -> None:
+        """Drop cached MCP tools.  Pass user_id to evict one entry, or None to clear all."""
+        if user_id is None and not self._mcp_tools_cache:
+            return
+        if user_id is None:
+            self._mcp_tools_cache.clear()
+        else:
+            self._mcp_tools_cache.pop(user_id, None)
+
+    def _build_mcp_tools(self, user_id: Optional[str] = None) -> List[Callable]:
         """Retrieve MCP tools from servers defined in the config and keep those server connections alive"""
         try:
             self._async_runner = AsyncLoopThread.get_instance()
 
             # Initialize MCP client on the background loop
             # The client and sessions will live on this loop
-            client, mcp_tools = self._async_runner.run(initialize_mcp_client())
+            client, mcp_tools, skills_text = self._async_runner.run(initialize_mcp_client(user_id=user_id))
             if client is None:
                 logger.info("No MCP servers configured.")
                 return None
             self.mcp_client = client
+            self._mcp_skills_text = skills_text or ""
 
             # Create synchronous wrappers that use the SAME loop
+            store_tool_input = self._store_tool_input
+
             def make_synchronous(async_tool):
                 """
                 Wrap an async tool for synchronous execution.
@@ -1082,10 +1219,24 @@ class BaseReActAgent:
                 """
                 # Capture the runner in closure
                 runner = self._async_runner
+                tool_name = async_tool.name
 
                 def sync_wrapper(*args, **kwargs):
                     if runner.in_loop_thread():
                         raise RuntimeError("sync_wrapper called from MCP loop thread; would deadlock")
+                    # Streamed tool_call chunks arrive without args; record here so the UI can resolve them by tool_call_id.
+                    try:
+                        recorded = {
+                            k: v
+                            for k, v in kwargs.items()
+                            if k not in {"config", "run_manager", "callbacks"}
+                        }
+                        if recorded:
+                            store_tool_input(tool_name, recorded)
+                    except Exception as exc:
+                        logger.debug(
+                            "Failed to record MCP tool input for %s: %s", tool_name, exc
+                        )
                     # Run on the background loop - NOT a new loop!
                     return runner.run(async_tool.coroutine(*args, **kwargs))
 
@@ -1153,7 +1304,8 @@ class BaseReActAgent:
         if hasattr(self, "_vector_tools"):
             extra_tools = self._vector_tools if self._vector_tools else None  # type: ignore[attr-defined]
 
-        self.refresh_agent(extra_tools=extra_tools)
+        user_id = kwargs.get("user_id")
+        self.refresh_agent(extra_tools=extra_tools, user_id=user_id)
 
         inputs = self._prepare_inputs(history=kwargs.get("history"))
         history_messages = inputs["history"]

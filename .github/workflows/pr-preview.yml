@@ -48,6 +48,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install . || true
           pip install -r requirements/requirements-base.txt
+          # langgraph-prebuilt 1.0.9+ imports ExecutionInfo from
+          # langgraph.runtime, a symbol that only exists in langgraph 1.2+.
+          # With langgraph==1.0.2 pinned in requirements-base.txt, pip's
+          # resolver still picks langgraph-prebuilt==1.0.13, breaking the
+          # import chain at test collection time. Force the last 1.0.x
+          # release that doesn't require ExecutionInfo.
+          # See: ImportError: cannot import name 'ExecutionInfo'
+          #      from 'langgraph.runtime'
+          pip install --force-reinstall --no-deps langgraph-prebuilt==1.0.8
           pip install pytest
 
       - name: Run unit tests
@@ -123,7 +132,13 @@ jobs:
           scripts/dev/build_docker_images.sh -i a2rchi/a2rchi-python-base "${{ steps.detect.outputs.tag }}"
 
       - name: Push updated base image to Docker Hub
-        if: steps.detect.outputs.changed == 'true'
+        # Skip when Docker Hub credentials aren't available — for example
+        # PRs from contexts where secrets aren't injected.  The image was
+        # already built and validated in the previous step; the push is
+        # what publishes it, and there's nothing useful we can do without
+        # credentials.  This avoids cascading the failure to dependent
+        # jobs (preview) on every PR that touches requirements-base.txt.
+        if: steps.detect.outputs.changed == 'true' && env.DOCKERHUB_USERNAME != ''
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -132,6 +147,14 @@ jobs:
           set -euo pipefail
           echo "$DOCKERHUB_TOKEN" | docker login docker.io --username "$DOCKERHUB_USERNAME" --password-stdin
           docker push "a2rchi/a2rchi-python-base:${TAG}"
+
+      - name: Note skipped Docker Hub push
+        if: steps.detect.outputs.changed == 'true' && env.DOCKERHUB_USERNAME == ''
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          echo "Skipping Docker Hub push: DOCKERHUB_USERNAME not available in this context." >> "$GITHUB_STEP_SUMMARY"
+          echo "The base image was built and validated locally; push will happen on a context with secrets." >> "$GITHUB_STEP_SUMMARY"
 
   # ── Smoke deployment + integration tests ────────────────────────────
   preview:
@@ -189,16 +212,43 @@ jobs:
           sudo systemctl restart docker
           docker info | grep -i "Storage Driver"
 
-      - name: Pull updated base image from Docker Hub
+      - name: Pull updated base image (Docker Hub or local rebuild fallback)
         if: needs.build-base-images.outputs.changed == 'true'
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           TAG: ${{ needs.build-base-images.outputs.tag }}
         run: |
-          set -euo pipefail
-          echo "$DOCKERHUB_TOKEN" | docker login docker.io --username "$DOCKERHUB_USERNAME" --password-stdin
-          docker pull "docker.io/a2rchi/a2rchi-python-base:${TAG}"
+          set -uo pipefail
+          IMAGE="docker.io/a2rchi/a2rchi-python-base:${TAG}"
+
+          # Try the Docker Hub path when credentials are present.  This is the
+          # fast path: the build-base-images job already produced and pushed
+          # the image, so we just pull it here.
+          pulled=false
+          if [[ -n "${DOCKERHUB_USERNAME:-}" && -n "${DOCKERHUB_TOKEN:-}" ]]; then
+            echo "$DOCKERHUB_TOKEN" | docker login docker.io --username "$DOCKERHUB_USERNAME" --password-stdin
+            if docker pull "$IMAGE"; then
+              pulled=true
+            else
+              echo "::warning::Docker Hub pull failed for $IMAGE; falling back to a local rebuild." >&2
+            fi
+          else
+            echo "::notice::Docker Hub credentials unavailable; rebuilding $IMAGE locally." >&2
+          fi
+
+          if [[ "$pulled" != "true" ]]; then
+            # Local rebuild — same command the build-base-images job uses.
+            # Requires the archi CLI (installed in the previous step) and the
+            # repo's build-helper script to be executable.
+            chmod +x scripts/dev/*.sh
+            scripts/dev/build_docker_images.sh -i a2rchi/a2rchi-python-base "${TAG}"
+            # Tag the locally-built image with the docker.io/ prefix so
+            # downstream compose references resolve without another pull.
+            docker tag "a2rchi/a2rchi-python-base:${TAG}" "$IMAGE" || true
+          fi
+          docker image inspect "$IMAGE" >/dev/null
+          echo "$IMAGE is available locally."
 
       - name: Prepare base image references
         if: needs.build-base-images.outputs.changed == 'true'

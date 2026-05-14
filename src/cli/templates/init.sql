@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS users (
     theme VARCHAR(20) NOT NULL DEFAULT 'system',
     preferred_model VARCHAR(200),          -- Override global default
     preferred_temperature NUMERIC(3,2),    -- Override global default
+    ab_participation_rate NUMERIC(3,2),    -- Per-user A/B sampling override
     preferred_max_tokens INTEGER,          -- Override global default
     preferred_num_documents INTEGER,       -- Override retrieval count
     preferred_condense_prompt VARCHAR(100), -- Prompt selection
@@ -74,7 +75,27 @@ CREATE INDEX IF NOT EXISTS idx_users_auth_provider ON users(auth_provider);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_github_id ON users(github_id) WHERE github_id IS NOT NULL;
 
 -- ============================================================================
--- 1.1 SESSIONS
+-- 1.1 MATTERMOST TOKENS
+-- ============================================================================
+-- Stores SSO refresh tokens for Mattermost users, enabling role-based access
+-- without requiring re-login on every message.
+
+CREATE TABLE IF NOT EXISTS mattermost_tokens (
+    mattermost_user_id  VARCHAR(255) PRIMARY KEY,
+    mattermost_username VARCHAR(255),
+    email               VARCHAR(255),
+    roles               JSONB NOT NULL DEFAULT '[]',
+    refresh_token       BYTEA,       -- pgp_sym_encrypt(token, BYOK_ENCRYPTION_KEY)
+    token_expires_at    TIMESTAMPTZ, -- when re-login is required (configurable session lifetime)
+    roles_refreshed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_mm_tokens_username ON mattermost_tokens(mattermost_username);
+
+-- ============================================================================
+-- 1.2 SESSIONS
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -87,6 +108,86 @@ CREATE TABLE IF NOT EXISTS sessions (
 
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+
+-- ============================================================================
+-- 1.3 SSO TOKENS (for MCP Bearer auth)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS sso_tokens (
+    user_id                 VARCHAR(200) PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    access_token            BYTEA,        -- pgp_sym_encrypt(token, BYOK_ENCRYPTION_KEY)
+    refresh_token           BYTEA,        -- pgp_sym_encrypt(token, BYOK_ENCRYPTION_KEY)
+    access_token_expires_at TIMESTAMPTZ,
+    session_expires_at      TIMESTAMPTZ,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- OAuth2 client registrations for MCP servers (one row per MCP server)
+CREATE TABLE IF NOT EXISTS mcp_oauth_clients (
+    server_name             VARCHAR(200) PRIMARY KEY,
+    server_url              TEXT NOT NULL,
+    client_id               TEXT NOT NULL,
+    client_secret           TEXT NOT NULL DEFAULT '',
+    redirect_uri            TEXT NOT NULL,
+    auth_meta               JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Per-user per-server MCP OAuth2 tokens
+CREATE TABLE IF NOT EXISTS mcp_oauth_tokens (
+    user_id                 VARCHAR(200) REFERENCES users(id) ON DELETE CASCADE,
+    server_name             VARCHAR(200) NOT NULL,
+    access_token            BYTEA,        -- pgp_sym_encrypt(token, encryption_key)
+    refresh_token           BYTEA,        -- pgp_sym_encrypt(token, encryption_key)
+    access_token_expires_at TIMESTAMPTZ,
+    session_expires_at      TIMESTAMPTZ,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, server_name)
+);
+
+-- ============================================================================
+-- 1.4 MCP API TOKENS (VS Code / Cursor / Claude Desktop integration)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS mcp_tokens (
+    token VARCHAR(64) PRIMARY KEY,        -- secrets.token_hex(32)
+    user_id VARCHAR(200) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    display_name TEXT,                    -- e.g. "VS Code – work laptop"
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_used_at TIMESTAMPTZ,
+    expires_at TIMESTAMPTZ                -- NULL = never expires
+);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_tokens_user ON mcp_tokens(user_id);
+
+-- Short-lived authorization codes for the OAuth2 PKCE flow used by MCP clients.
+CREATE TABLE IF NOT EXISTS mcp_auth_codes (
+    code VARCHAR(64) PRIMARY KEY,
+    user_id VARCHAR(200) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    code_challenge VARCHAR(128) NOT NULL,
+    code_challenge_method VARCHAR(10) NOT NULL DEFAULT 'S256',
+    redirect_uri TEXT NOT NULL,
+    client_id VARCHAR(100) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '10 minutes',
+    used BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_auth_codes_expires ON mcp_auth_codes(expires_at);
+
+-- OAuth2 dynamic client registrations (RFC 7591) for INBOUND MCP clients
+-- (e.g. Claude Desktop, VS Code, Cursor connecting to archi's MCP SSE
+-- endpoint).  Distinct from `mcp_oauth_clients` above, which records archi's
+-- OUTBOUND client registrations against remote MCP servers.
+CREATE TABLE IF NOT EXISTS mcp_inbound_clients (
+    client_id VARCHAR(32) PRIMARY KEY,    -- secrets.token_hex(16)
+    client_name TEXT,
+    redirect_uris TEXT[] NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
 -- ============================================================================
 -- 2. STATIC CONFIGURATION (Deploy-Time)
@@ -355,11 +456,20 @@ CREATE TABLE IF NOT EXISTS conversation_metadata (
     title TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_message_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    archi_version VARCHAR(50)
+    archi_version VARCHAR(50),
+    -- Cross-platform fields (added for Mattermost ↔ web-chat continuity)
+    archi_service TEXT NOT NULL DEFAULT 'chat',   -- 'chat' | 'mattermost'
+    source_ref    TEXT DEFAULT NULL               -- e.g. "mm_thread_<post_id>"
 );
 
-CREATE INDEX IF NOT EXISTS idx_conv_meta_user ON conversation_metadata(user_id);
-CREATE INDEX IF NOT EXISTS idx_conv_meta_client ON conversation_metadata(client_id);
+CREATE INDEX IF NOT EXISTS idx_conv_meta_user       ON conversation_metadata(user_id);
+CREATE INDEX IF NOT EXISTS idx_conv_meta_client     ON conversation_metadata(client_id);
+CREATE INDEX IF NOT EXISTS idx_conv_meta_source_ref ON conversation_metadata(source_ref);
+
+-- Live-database migrations: add columns that may be missing in existing deployments
+ALTER TABLE conversation_metadata ADD COLUMN IF NOT EXISTS archi_service TEXT NOT NULL DEFAULT 'chat';
+ALTER TABLE conversation_metadata ADD COLUMN IF NOT EXISTS source_ref    TEXT DEFAULT NULL;
+CREATE INDEX IF NOT EXISTS idx_conv_meta_source_ref ON conversation_metadata(source_ref);
 
 -- Add FK to conversation_doc_overrides now that conversation_metadata exists
 DO $$
@@ -503,6 +613,12 @@ CREATE TABLE IF NOT EXISTS ab_comparisons (
     config_a_id INTEGER REFERENCES configs(config_id),
     config_b_id INTEGER REFERENCES configs(config_id),
     
+    -- Pool-based variant info (populated when ab_testing pool is active)
+    variant_a_name VARCHAR(200),
+    variant_b_name VARCHAR(200),
+    variant_a_meta JSONB,
+    variant_b_meta JSONB,
+    
     is_config_a_first BOOLEAN NOT NULL,
     preference VARCHAR(10),
     preference_ts TIMESTAMPTZ,
@@ -513,6 +629,48 @@ CREATE INDEX IF NOT EXISTS idx_ab_comparisons_conversation ON ab_comparisons(con
 CREATE INDEX IF NOT EXISTS idx_ab_comparisons_models ON ab_comparisons(model_a, model_b);
 CREATE INDEX IF NOT EXISTS idx_ab_comparisons_preference ON ab_comparisons(preference) WHERE preference IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_ab_comparisons_pending ON ab_comparisons(conversation_id) WHERE preference IS NULL;
+CREATE INDEX IF NOT EXISTS idx_ab_comparisons_variant_a ON ab_comparisons(variant_a_name) WHERE variant_a_name IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_ab_comparisons_variant_b ON ab_comparisons(variant_b_name) WHERE variant_b_name IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS ab_agent_specs (
+    spec_id SERIAL PRIMARY KEY,
+    filename VARCHAR(255) NOT NULL UNIQUE,
+    current_name VARCHAR(255) NOT NULL UNIQUE,
+    current_version_id INTEGER,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_saved_by VARCHAR(200)
+);
+
+CREATE TABLE IF NOT EXISTS ab_agent_spec_versions (
+    version_id SERIAL PRIMARY KEY,
+    spec_id INTEGER NOT NULL REFERENCES ab_agent_specs(spec_id) ON DELETE CASCADE,
+    version_number INTEGER NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    tools TEXT[] NOT NULL DEFAULT '{}',
+    prompt TEXT NOT NULL,
+    content TEXT NOT NULL,
+    ab_only BOOLEAN NOT NULL DEFAULT FALSE,
+    content_hash VARCHAR(64) NOT NULL,
+    prompt_hash VARCHAR(64) NOT NULL,
+    source_type VARCHAR(50) NOT NULL DEFAULT 'ui',
+    source_path TEXT,
+    created_by VARCHAR(200),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (spec_id, version_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ab_agent_spec_versions_spec ON ab_agent_spec_versions(spec_id, version_number DESC);
+
+-- Per-variant aggregate metrics (wins/losses/ties)
+CREATE TABLE IF NOT EXISTS ab_variant_metrics (
+    variant_name VARCHAR(200) PRIMARY KEY,
+    wins INTEGER NOT NULL DEFAULT 0,
+    losses INTEGER NOT NULL DEFAULT 0,
+    ties INTEGER NOT NULL DEFAULT 0,
+    total_comparisons INTEGER NOT NULL DEFAULT 0,
+    last_updated TIMESTAMP NOT NULL DEFAULT NOW()
+);
 
 -- ============================================================================
 -- 9. MIGRATION STATE (for resumable migrations)
@@ -576,6 +734,7 @@ GRANT SELECT ON
     timing,
     agent_tool_calls,
     ab_comparisons,
+    ab_variant_metrics,
     migration_state
 TO grafana;
 {% endif %}

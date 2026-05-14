@@ -26,6 +26,9 @@ class Permission:
         HISTORY = "chat:history"
         FEEDBACK = "chat:feedback"
 
+    class Mattermost(str, Enum):
+        ACCESS = "mattermost:access"  # Gate for Mattermost bot access (not granted to base-user)
+
     class Documents(str, Enum):
         VIEW = "documents:view"
         SELECT = "documents:select"
@@ -55,6 +58,12 @@ class Permission:
 
     class Metrics(str, Enum):
         VIEW = "view:metrics"
+
+    class AB(str, Enum):
+        VIEW = "ab:view"
+        MANAGE = "ab:manage"
+        METRICS = "ab:metrics"
+        PARTICIPATE = "ab:participate"
 
     class Alerts(str, Enum):
         MANAGE = "alerts:manage"

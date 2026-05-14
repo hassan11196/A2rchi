@@ -33,7 +33,7 @@ LIMIT 1;
 """
 
 SQL_QUERY_CONVO = """
-SELECT sender, content
+SELECT sender, content, message_id
 FROM conversations
 WHERE conversation_id = %s
 ORDER BY message_id ASC;
@@ -160,6 +160,55 @@ WHERE conversation_id = %s AND (user_id = %s OR client_id = %s);
 """
 
 # =============================================================================
+# Cross-platform (Mattermost ↔ web-chat) conversation queries
+# =============================================================================
+
+# Look up integer conversation_id by external source_ref (e.g. "mm_thread_xxx")
+SQL_MM_GET_CONV_ID_BY_SOURCE_REF = """
+SELECT conversation_id FROM conversation_metadata
+WHERE source_ref = %s
+LIMIT 1;
+"""
+
+# Create a conversation_metadata row for a Mattermost thread/channel
+SQL_MM_CREATE_CONVERSATION = """
+INSERT INTO conversation_metadata (
+    title, created_at, last_message_at, client_id, archi_version, archi_service, source_ref
+)
+VALUES (%s, %s, %s, %s, %s, 'mattermost', %s)
+RETURNING conversation_id;
+"""
+
+# Update last_message_at for a Mattermost conversation (matched by integer id + source_ref)
+SQL_MM_UPDATE_CONVERSATION_TIMESTAMP = """
+UPDATE conversation_metadata
+SET last_message_at = %s
+WHERE conversation_id = %s;
+"""
+
+# List conversations for an authenticated user, including Mattermost ones linked by
+# mm_client_id = "mm_user_{preferred_username}".  Three ownership checks:
+#   1. user_id matches (web-chat SSO conversations)
+#   2. client_id matches (anonymous / browser-keyed conversations)
+#   3. client_id = mm_client_id  (Mattermost-originated conversations)
+SQL_LIST_CONVERSATIONS_ALL_SOURCES = """
+SELECT conversation_id, title, created_at, last_message_at,
+       COALESCE(archi_service, 'chat') AS archi_service
+FROM conversation_metadata
+WHERE user_id = %s OR client_id = %s OR client_id = %s
+ORDER BY last_message_at DESC
+LIMIT %s;
+"""
+
+# Fetch metadata for a single conversation, accepting any of the three ownership proofs
+SQL_GET_CONVERSATION_METADATA_ALL_SOURCES = """
+SELECT conversation_id, title, created_at, last_message_at,
+       COALESCE(archi_service, 'chat') AS archi_service
+FROM conversation_metadata
+WHERE conversation_id = %s AND (user_id = %s OR client_id = %s OR client_id = %s);
+"""
+
+# =============================================================================
 # Tool Calls Queries
 # =============================================================================
 
@@ -184,9 +233,11 @@ ORDER BY step_number ASC;
 SQL_INSERT_AB_COMPARISON = """
 INSERT INTO ab_comparisons (
     conversation_id, user_prompt_mid, response_a_mid, response_b_mid, 
-    model_a, pipeline_a, model_b, pipeline_b, is_config_a_first
+    model_a, pipeline_a, model_b, pipeline_b,
+    variant_a_name, variant_b_name, variant_a_meta, variant_b_meta,
+    is_config_a_first
 )
-VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 RETURNING comparison_id;
 """
 
@@ -199,19 +250,47 @@ WHERE comparison_id = %s;
 SQL_GET_AB_COMPARISON = """
 SELECT comparison_id, conversation_id, user_prompt_mid, response_a_mid, response_b_mid,
        model_a, pipeline_a, model_b, pipeline_b, 
+       variant_a_name, variant_b_name, variant_a_meta, variant_b_meta,
        is_config_a_first, preference, preference_ts, created_at
 FROM ab_comparisons
 WHERE comparison_id = %s;
 """
 
+SQL_GET_AB_COMPARISON_FOR_UPDATE = """
+SELECT comparison_id, conversation_id, user_prompt_mid, response_a_mid, response_b_mid,
+       model_a, pipeline_a, model_b, pipeline_b,
+       variant_a_name, variant_b_name, variant_a_meta, variant_b_meta,
+       is_config_a_first, preference, preference_ts, created_at
+FROM ab_comparisons
+WHERE comparison_id = %s
+FOR UPDATE;
+"""
+
 SQL_GET_PENDING_AB_COMPARISON = """
 SELECT comparison_id, conversation_id, user_prompt_mid, response_a_mid, response_b_mid,
        model_a, pipeline_a, model_b, pipeline_b,
+       variant_a_name, variant_b_name, variant_a_meta, variant_b_meta,
        is_config_a_first, preference, preference_ts, created_at
 FROM ab_comparisons
 WHERE conversation_id = %s AND preference IS NULL
 ORDER BY created_at DESC
 LIMIT 1;
+"""
+
+SQL_GET_PENDING_AB_COMPARISONS = """
+SELECT comparison_id, conversation_id, user_prompt_mid, response_a_mid, response_b_mid,
+       model_a, pipeline_a, model_b, pipeline_b,
+       variant_a_name, variant_b_name, variant_a_meta, variant_b_meta,
+       is_config_a_first, preference, preference_ts, created_at
+FROM ab_comparisons
+WHERE conversation_id = %s AND preference IS NULL
+ORDER BY created_at ASC, comparison_id ASC;
+"""
+
+SQL_COUNT_PENDING_AB_COMPARISONS = """
+SELECT COUNT(*)
+FROM ab_comparisons
+WHERE conversation_id = %s AND preference IS NULL;
 """
 
 SQL_DELETE_AB_COMPARISON = """
@@ -222,11 +301,34 @@ WHERE comparison_id = %s;
 SQL_GET_AB_COMPARISONS_BY_CONVERSATION = """
 SELECT comparison_id, conversation_id, user_prompt_mid, response_a_mid, response_b_mid,
        model_a, pipeline_a, model_b, pipeline_b,
+       variant_a_name, variant_b_name, variant_a_meta, variant_b_meta,
        is_config_a_first, preference, preference_ts, created_at
 FROM ab_comparisons
 WHERE conversation_id = %s
 ORDER BY created_at ASC;
 """
+
+# =============================================================================
+# A/B Variant Metrics Queries
+# =============================================================================
+
+SQL_UPSERT_VARIANT_METRIC = """
+INSERT INTO ab_variant_metrics (variant_name, wins, losses, ties, total_comparisons, last_updated)
+VALUES (%s, %s, %s, %s, %s, NOW())
+ON CONFLICT (variant_name) DO UPDATE
+SET wins = ab_variant_metrics.wins + EXCLUDED.wins,
+    losses = ab_variant_metrics.losses + EXCLUDED.losses,
+    ties = ab_variant_metrics.ties + EXCLUDED.ties,
+    total_comparisons = ab_variant_metrics.total_comparisons + EXCLUDED.total_comparisons,
+    last_updated = NOW();
+"""
+
+SQL_GET_ALL_VARIANT_METRICS = """
+SELECT variant_name, wins, losses, ties, total_comparisons, last_updated
+FROM ab_variant_metrics
+ORDER BY total_comparisons DESC;
+"""
+
 
 # =============================================================================
 # Agent Trace Queries
