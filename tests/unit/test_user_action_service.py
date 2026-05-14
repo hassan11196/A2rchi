@@ -110,6 +110,11 @@ class FakePool:
     def get_connection(self):
         return FakeConn(self.store)
 
+    # Services moved to get_connection_direct (returns a raw conn, not a
+    # context manager).  In the fake, both shapes hand out the same FakeConn.
+    def get_connection_direct(self):
+        return FakeConn(self.store)
+
     def release_connection(self, _conn):
         pass
 
