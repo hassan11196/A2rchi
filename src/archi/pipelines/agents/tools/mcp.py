@@ -129,6 +129,12 @@ async def initialize_mcp_client(
             for tool in tools:
                 # Return error messages to the LLM instead of crashing the agent chain.
                 tool.handle_tool_error = True
+                # Tag with originating MCP server so downstream guardrails can
+                # look up per-server policy from mcp_servers_config.
+                try:
+                    tool._archi_server_name = name  # type: ignore[attr-defined]
+                except Exception:
+                    pass
                 logger.info(f"Loaded tool from MCP server '{name}': {tool.name} - {tool.description}")
             all_tools.extend(tools)
         except Exception as e:

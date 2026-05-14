@@ -342,6 +342,36 @@ class ConfigService:
                     "CREATE INDEX IF NOT EXISTS idx_mm_tokens_username "
                     "ON mattermost_tokens(mattermost_username)"
                 )
+                # MCP tool approvals (Claude-style write/execute gate).
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS tool_approvals (
+                        approval_id     VARCHAR(64) PRIMARY KEY,
+                        conversation_id INTEGER,
+                        message_id      INTEGER,
+                        user_id         VARCHAR(200),
+                        server_name     VARCHAR(200) NOT NULL,
+                        tool_name       VARCHAR(200) NOT NULL,
+                        tool_args       JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        args_hash       VARCHAR(64) NOT NULL,
+                        sensitivity     VARCHAR(20) NOT NULL DEFAULT 'write',
+                        status          VARCHAR(20) NOT NULL DEFAULT 'pending',
+                        requested_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        decided_at      TIMESTAMPTZ,
+                        decided_by      VARCHAR(200),
+                        expires_at      TIMESTAMPTZ NOT NULL,
+                        source          VARCHAR(20) NOT NULL DEFAULT 'chat'
+                    )
+                    """
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tool_approvals_lookup "
+                    "ON tool_approvals (conversation_id, tool_name, args_hash, status)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tool_approvals_status_expires "
+                    "ON tool_approvals (status, expires_at)"
+                )
                 conn.commit()
         except psycopg2.Error as e:
             logger.debug("Could not ensure config tables/columns: %s", e)

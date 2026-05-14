@@ -65,6 +65,17 @@ class BaseReActAgent:
         # silently refreshes once we rebuild.
         self._MCP_TOOLS_TTL_SECONDS = 60.0
         self._mcp_skills_text: str = ""
+        # Map tool.name -> server_name (populated during _build_mcp_tools).
+        # Used by the MCP-guardrail to look up per-server policy.
+        self._mcp_tool_server_map: Dict[str, str] = {}
+        # Per-request context (set by _prepare_agent_inputs from kwargs)
+        # so tool wrappers know which user/conversation triggered the call.
+        self._current_user_id: Optional[str] = None
+        self._current_conversation_id: Optional[int] = None
+        # Hook for surfaces to be notified when a pending approval is created.
+        # Signature: callable(approval_dict). Set externally (e.g. by the chat
+        # streamer) so the SSE loop can emit a tool_approval_request event.
+        self._approval_notifier: Optional[Callable[[Dict[str, Any]], None]] = None
         self._active_tools: List[Callable] = []
         self._static_middleware: Optional[List[Callable]] = None
         self._active_middleware: List[Callable] = []
@@ -1205,8 +1216,18 @@ class BaseReActAgent:
             self.mcp_client = client
             self._mcp_skills_text = skills_text or ""
 
+            # Rebuild the (tool_name -> server_name) map every time we fetch
+            # tools so per-server policy lookups in _check_mcp_guardrail stay
+            # accurate even after a tool list changes.
+            self._mcp_tool_server_map = {}
+            for t in mcp_tools or []:
+                srv = getattr(t, "_archi_server_name", None)
+                if srv:
+                    self._mcp_tool_server_map[t.name] = srv
+
             # Create synchronous wrappers that use the SAME loop
             store_tool_input = self._store_tool_input
+            guardrail_check = self._check_mcp_guardrail
 
             def make_synchronous(async_tool):
                 """
@@ -1220,11 +1241,14 @@ class BaseReActAgent:
                 # Capture the runner in closure
                 runner = self._async_runner
                 tool_name = async_tool.name
+                tool_description = getattr(async_tool, "description", "") or ""
+                server_name = getattr(async_tool, "_archi_server_name", None)
 
                 def sync_wrapper(*args, **kwargs):
                     if runner.in_loop_thread():
                         raise RuntimeError("sync_wrapper called from MCP loop thread; would deadlock")
                     # Streamed tool_call chunks arrive without args; record here so the UI can resolve them by tool_call_id.
+                    recorded: Dict[str, Any] = {}
                     try:
                         recorded = {
                             k: v
@@ -1237,6 +1261,21 @@ class BaseReActAgent:
                         logger.debug(
                             "Failed to record MCP tool input for %s: %s", tool_name, exc
                         )
+
+                    # Guardrail: if this tool needs approval and we don't have
+                    # one on file, short-circuit with a message the LLM can
+                    # relay to the user. The user approves/denies via the UI
+                    # (or Mattermost) and the next chat turn re-invokes the
+                    # tool, at which point find_decision returns 'approved'.
+                    guard_msg = guardrail_check(
+                        tool_name=tool_name,
+                        tool_description=tool_description,
+                        server_name=server_name,
+                        tool_args=recorded,
+                    )
+                    if guard_msg is not None:
+                        return guard_msg
+
                     # Run on the background loop - NOT a new loop!
                     return runner.run(async_tool.coroutine(*args, **kwargs))
 
@@ -1252,6 +1291,156 @@ class BaseReActAgent:
 
         except Exception as e:
             logger.error(f"Failed to load MCP tools: {e}", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # MCP guardrail (approval gate)
+    # ------------------------------------------------------------------
+
+    def _get_tool_approval_service(self):
+        """Return a ToolApprovalService instance (lazy-built + cached).
+
+        Falls back to None if no DB config is reachable (e.g. unit tests),
+        in which case the guardrail degrades to safe-only behaviour: write
+        and execute tools simply run without an approval check, matching
+        pre-guardrail behaviour.
+        """
+        svc = getattr(self, "_tool_approval_service_singleton", None)
+        if svc is not None:
+            return svc
+        try:
+            from src.utils.postgres_service_factory import PostgresServiceFactory
+            factory = PostgresServiceFactory._instance  # type: ignore[attr-defined]
+            if factory is None:
+                return None
+            svc = factory.tool_approval_service
+            self._tool_approval_service_singleton = svc
+            return svc
+        except Exception as exc:
+            logger.debug("Tool approval service unavailable: %s", exc)
+            return None
+
+    def _check_mcp_guardrail(
+        self,
+        *,
+        tool_name: str,
+        tool_description: str,
+        server_name: Optional[str],
+        tool_args: Dict[str, Any],
+    ) -> Optional[str]:
+        """Return None when the call may proceed, else a short-circuit message.
+
+        Resolution:
+          1. Classify the tool (heuristic + per-server overrides).
+          2. If classification is ``safe`` OR the principal is on the
+             auto-approve list, return None.
+          3. Look up an existing decision in ``tool_approvals``.  If
+             ``approved``, return None.  If ``denied``, return a denial string.
+          4. Otherwise create a new pending row, fire the approval notifier,
+             and return a "waiting for approval" string.
+        """
+        from src.archi.pipelines.agents.tools.mcp_guardrails import (
+            classify_tool, is_auto_approved,
+        )
+        from src.utils.tool_approval_service import hash_tool_args
+
+        # Resolve per-server config from the live mcp_servers_config.
+        server_cfg: Dict[str, Any] = {}
+        if server_name:
+            try:
+                from src.utils.config_access import get_mcp_servers_config
+                all_servers = get_mcp_servers_config() or {}
+                server_cfg = dict(all_servers.get(server_name) or {})
+            except Exception as exc:
+                logger.debug("Could not read mcp_servers_config for guardrail: %s", exc)
+
+        classification = classify_tool(tool_name, tool_description, server_cfg)
+        if not classification.requires_approval:
+            return None
+        if is_auto_approved(classification, self._current_user_id):
+            return None
+
+        service = self._get_tool_approval_service()
+        if service is None:
+            logger.warning(
+                "MCP guardrail: tool %s (sensitivity=%s) would require "
+                "approval, but no ToolApprovalService is available; "
+                "allowing.", tool_name, classification.sensitivity,
+            )
+            return None
+
+        args_hash = hash_tool_args(tool_args)
+        existing = service.find_decision(
+            conversation_id=self._current_conversation_id,
+            tool_name=tool_name,
+            args_hash=args_hash,
+        )
+        if existing and existing.status == "approved":
+            logger.info("MCP guardrail: %s pre-approved (id=%s)", tool_name, existing.approval_id)
+            return None
+        if existing and existing.status == "denied":
+            return (
+                f"Tool {tool_name!r} was denied by the user "
+                f"(approval id {existing.approval_id})."
+            )
+        if existing and existing.status == "pending":
+            payload = self._approval_payload(existing, tool_args)
+            self._fire_approval_notifier(payload)
+            return self._pending_message(payload)
+
+        # No prior decision — create one.
+        try:
+            pending = service.create_pending(
+                conversation_id=self._current_conversation_id,
+                message_id=None,
+                user_id=self._current_user_id,
+                server_name=server_name or "",
+                tool_name=tool_name,
+                tool_args=tool_args or {},
+                sensitivity=classification.sensitivity,
+                source="chat",
+            )
+        except Exception as exc:
+            logger.warning(
+                "MCP guardrail: failed to record pending approval for %s: %s",
+                tool_name, exc,
+            )
+            return None
+
+        payload = self._approval_payload(pending, tool_args)
+        self._fire_approval_notifier(payload)
+        return self._pending_message(payload)
+
+    @staticmethod
+    def _approval_payload(approval, tool_args: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "approval_id": approval.approval_id,
+            "tool_name": approval.tool_name,
+            "server_name": approval.server_name,
+            "sensitivity": approval.sensitivity,
+            "tool_args": tool_args,
+            "expires_at": approval.expires_at.isoformat() if approval.expires_at else None,
+            "status": approval.status,
+        }
+
+    def _fire_approval_notifier(self, payload: Dict[str, Any]) -> None:
+        notifier = self._approval_notifier
+        if notifier is None:
+            return
+        try:
+            notifier(payload)
+        except Exception as exc:
+            logger.debug("Approval notifier raised: %s", exc)
+
+    @staticmethod
+    def _pending_message(payload: Dict[str, Any]) -> str:
+        return (
+            f"Tool call awaiting user approval. "
+            f"approval_id={payload['approval_id']!r}, "
+            f"tool={payload['tool_name']!r}, "
+            f"sensitivity={payload['sensitivity']!r}. "
+            f"Ask the user to approve or deny the request; rerun this tool "
+            f"after they respond."
+        )
 
     def _build_static_middleware(self) -> List[Callable]:
         """Build and returns static middleware defined in the config."""
@@ -1305,6 +1494,14 @@ class BaseReActAgent:
             extra_tools = self._vector_tools if self._vector_tools else None  # type: ignore[attr-defined]
 
         user_id = kwargs.get("user_id")
+        # Stash per-request context for tool wrappers (MCP guardrail).
+        self._current_user_id = user_id
+        conv_id = kwargs.get("conversation_id")
+        try:
+            self._current_conversation_id = int(conv_id) if conv_id not in (None, "") else None
+        except (TypeError, ValueError):
+            self._current_conversation_id = None
+        self._approval_notifier = kwargs.get("approval_notifier") or self._approval_notifier
         self.refresh_agent(extra_tools=extra_tools, user_id=user_id)
 
         inputs = self._prepare_inputs(history=kwargs.get("history"))
