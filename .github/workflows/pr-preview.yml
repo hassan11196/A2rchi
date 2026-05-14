@@ -60,7 +60,23 @@ jobs:
           pip install pytest
 
       - name: Run unit tests
-        run: python -m pytest tests/unit/ -v --tb=short
+        run: |
+          set -o pipefail
+          python -m pytest tests/unit/ -v --tb=long 2>&1 | tee /tmp/pytest.log
+
+      - name: Surface pytest failures as annotations
+        if: failure()
+        run: |
+          grep -E '^(FAILED|ERROR|E   |    File "|Traceback|.+Error: |==.*failed|==.*errors|=+ ERRORS|=+ FAILURES|ModuleNotFoundError|ImportError|AssertionError|AttributeError|>     |[^:]+:[0-9]+: in )' /tmp/pytest.log \
+            | head -n 150 \
+            | while IFS= read -r line; do
+                msg=$(printf '%s' "$line" | sed 's/%/%25/g; s/$/%0A/' | tr -d '\n')
+                echo "::error::${msg}"
+              done || true
+          pip freeze | grep -iE 'langchain|langgraph|psycopg' | while IFS= read -r pkg; do
+            msg=$(printf 'env: %s' "$pkg" | sed 's/%/%25/g')
+            echo "::error::${msg}"
+          done || true
 
   # ── Build base images (only when inputs change) ─────────────────────
   build-base-images:
