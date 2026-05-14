@@ -49,6 +49,10 @@ watchfiles==0.21.0
 zstandard==0.25.0
 langchain-openai==1.1.10
 langchain-community==0.4
+# DuckDuckGoSearchAPIWrapper in langchain-community>=0.3 imports from `ddgs`
+# (formerly `duckduckgo-search`); without this pin the web_search tool
+# crashes service_chat startup with ModuleNotFoundError: No module named 'ddgs'.
+ddgs==9.8.0
 langchain-core==1.2.13
 langchain-text-splitters==1.0.0
 langchain-huggingface==1.0.0
