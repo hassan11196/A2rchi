@@ -3548,13 +3548,13 @@ body {
    scrolled. Mirrors the Claude Code interactive approval modal in spirit:
    tool name, args, sensitivity badge, approve/deny, and "Don't ask again".
    ----------------------------------------------------------------------------- */
+/* Lives inside .input-container, so width/centering is inherited.
+   Just stack any pending approval cards vertically above the input. */
 .approval-tray {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  padding: 10px 16px 8px 16px;
-  border-top: 1px solid var(--border-color);
-  background: var(--bg-secondary);
+  width: 100%;
   max-height: 45vh;
   overflow-y: auto;
 }
@@ -3584,17 +3584,15 @@ body {
 
 .tool-approval-card {
   border: 1px solid var(--warning-color, #ca8a04);
-  border-radius: 8px;
+  border-radius: 12px;
   background: rgba(202, 138, 4, 0.12);
-  padding: 12px;
+  padding: 12px 14px;
   margin: 0;
   display: flex;
   flex-direction: column;
   gap: 10px;
   color: var(--text-primary);
-  max-width: 880px;
   width: 100%;
-  align-self: center;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
 }
 

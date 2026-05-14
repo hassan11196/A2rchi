@@ -3283,13 +3283,17 @@ const UI = {
   getApprovalTray() {
     let tray = document.querySelector('.approval-tray');
     if (!tray) {
-      // Fallback if the markup is missing: create one above the input footer.
-      const footer = document.querySelector('footer.input-area');
-      if (!footer) return null;
+      // Fallback when markup is missing: insert inside .input-container so
+      // it stacks ABOVE .input-wrapper instead of becoming a row-flex sibling
+      // of the input area (which renders as a side column).
+      const container = document.querySelector('footer.input-area .input-container');
+      if (!container) return null;
       tray = document.createElement('div');
       tray.className = 'approval-tray';
       tray.hidden = true;
-      footer.insertBefore(tray, footer.firstChild);
+      const wrapper = container.querySelector('.input-wrapper');
+      if (wrapper) container.insertBefore(tray, wrapper);
+      else container.appendChild(tray);
     }
     return tray;
   },
