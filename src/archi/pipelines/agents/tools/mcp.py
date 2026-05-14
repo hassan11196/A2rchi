@@ -75,17 +75,16 @@ async def initialize_mcp_client(
     full_config = get_full_config()
 
     for name, server_cfg in mcp_servers.items():
-        # SSO-gated server: require a valid OAuth token before proceeding.  Read
-        # the flag from the raw server_cfg before stripping archi-only fields.
+        # SSO-gated server: look up a per-user OAuth token if we have one, but
+        # always register the server so its tools are discoverable at boot.
+        # The Authorization header is injected only when a token is available;
+        # without one, upstream calls that require auth will fail per-call.
         requires_sso = server_cfg.get('sso_auth', False)
-        if requires_sso:
-            access_token = _mcp_oauth.get_access_token(user_id, name) if user_id else None
-            if not access_token:
-                logger.info(
-                    f"Skipping MCP server '{name}': sso_auth=true but no valid "
-                    f"token for user_id={user_id!r}"
-                )
-                continue
+        access_token = (
+            _mcp_oauth.get_access_token(user_id, name)
+            if requires_sso and user_id
+            else None
+        )
 
         # Load any declared skill so we can append it to the agent system prompt.
         skill_name = server_cfg.get("skill")
@@ -97,7 +96,7 @@ async def initialize_mcp_client(
         # Strip archi-only fields the MCP client doesn't understand.
         cfg = {k: v for k, v in server_cfg.items() if k not in _ARCHI_ONLY_FIELDS}
 
-        if requires_sso:
+        if requires_sso and access_token:
             cfg.setdefault('headers', {})['Authorization'] = f'Bearer {access_token}'
 
         transport = cfg.get("transport")

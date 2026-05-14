@@ -89,7 +89,7 @@ class UserActionService:
     # ---------------------------------------------------------------- conns
     def _get_connection(self):
         if self._pool:
-            return self._pool.get_connection()
+            return self._pool.get_connection_direct()
         if self._conn_params:
             return psycopg2.connect(**self._conn_params)
         raise ValueError("UserActionService needs a connection pool or params")
