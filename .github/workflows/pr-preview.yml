@@ -212,16 +212,43 @@ jobs:
           sudo systemctl restart docker
           docker info | grep -i "Storage Driver"
 
-      - name: Pull updated base image from Docker Hub
+      - name: Pull updated base image (Docker Hub or local rebuild fallback)
         if: needs.build-base-images.outputs.changed == 'true'
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           TAG: ${{ needs.build-base-images.outputs.tag }}
         run: |
-          set -euo pipefail
-          echo "$DOCKERHUB_TOKEN" | docker login docker.io --username "$DOCKERHUB_USERNAME" --password-stdin
-          docker pull "docker.io/a2rchi/a2rchi-python-base:${TAG}"
+          set -uo pipefail
+          IMAGE="docker.io/a2rchi/a2rchi-python-base:${TAG}"
+
+          # Try the Docker Hub path when credentials are present.  This is the
+          # fast path: the build-base-images job already produced and pushed
+          # the image, so we just pull it here.
+          pulled=false
+          if [[ -n "${DOCKERHUB_USERNAME:-}" && -n "${DOCKERHUB_TOKEN:-}" ]]; then
+            echo "$DOCKERHUB_TOKEN" | docker login docker.io --username "$DOCKERHUB_USERNAME" --password-stdin
+            if docker pull "$IMAGE"; then
+              pulled=true
+            else
+              echo "::warning::Docker Hub pull failed for $IMAGE; falling back to a local rebuild." >&2
+            fi
+          else
+            echo "::notice::Docker Hub credentials unavailable; rebuilding $IMAGE locally." >&2
+          fi
+
+          if [[ "$pulled" != "true" ]]; then
+            # Local rebuild — same command the build-base-images job uses.
+            # Requires the archi CLI (installed in the previous step) and the
+            # repo's build-helper script to be executable.
+            chmod +x scripts/dev/*.sh
+            scripts/dev/build_docker_images.sh -i a2rchi/a2rchi-python-base "${TAG}"
+            # Tag the locally-built image with the docker.io/ prefix so
+            # downstream compose references resolve without another pull.
+            docker tag "a2rchi/a2rchi-python-base:${TAG}" "$IMAGE" || true
+          fi
+          docker image inspect "$IMAGE" >/dev/null
+          echo "$IMAGE is available locally."
 
       - name: Prepare base image references
         if: needs.build-base-images.outputs.changed == 'true'
