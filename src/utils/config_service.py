@@ -342,6 +342,29 @@ class ConfigService:
                     "CREATE INDEX IF NOT EXISTS idx_mm_tokens_username "
                     "ON mattermost_tokens(mattermost_username)"
                 )
+                # user_actions — write-operation audit timeline.
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS user_actions (
+                        action_id   VARCHAR(64) PRIMARY KEY,
+                        user_id     VARCHAR(200),
+                        action_type VARCHAR(100) NOT NULL,
+                        target_kind VARCHAR(100),
+                        target_id   VARCHAR(200),
+                        payload     JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        source      VARCHAR(20) NOT NULL DEFAULT 'web',
+                        ts          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_user_actions_user_ts "
+                    "ON user_actions (user_id, ts DESC)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_user_actions_type_ts "
+                    "ON user_actions (action_type, ts DESC)"
+                )
                 conn.commit()
         except psycopg2.Error as e:
             logger.debug("Could not ensure config tables/columns: %s", e)
