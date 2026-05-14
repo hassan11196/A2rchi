@@ -997,6 +997,28 @@ const UI = {
       }
     });
 
+    // Permission mode pill above the chat input — open menu on click.
+    document.addEventListener('click', (e) => {
+      const toggle = e.target.closest && e.target.closest('[data-approval-mode-indicator]');
+      if (toggle) {
+        e.stopPropagation();
+        UI.toggleApprovalModeMenu();
+        return;
+      }
+      // Menu item click -> set mode + close.
+      const item = e.target.closest && e.target.closest('.approval-mode-bar__menu [data-approval-mode]');
+      if (item) {
+        Chat.setApprovalMode(item.dataset.approvalMode);
+        UI.toggleApprovalModeMenu(false);
+        return;
+      }
+      // Click outside open menu -> close.
+      const openMenu = document.querySelector('.approval-mode-bar__menu:not([hidden])');
+      if (openMenu && !openMenu.contains(e.target)) {
+        UI.toggleApprovalModeMenu(false);
+      }
+    });
+
     // Always-allowed tools — remove buttons (delegated)
     document.addEventListener('click', (e) => {
       const removeBtn = e.target.closest && e.target.closest('.allowed-tools-list__remove');
@@ -3325,29 +3347,28 @@ const UI = {
     const toolKey = serverName ? `${serverName}:${toolName}` : toolName;
     const toolKeyAttr = Utils.escapeAttr(toolKey);
 
+    // One-row banner inspired by Cline's ActionButtons row
+    // (https://github.com/cline/cline/tree/main/webview-ui/src/components/chat/chat-view/components/layout).
+    // Stays compact (~36-40px). <details> reveals args inline, capped with
+    // overflow:auto so it can't push the chat off screen.
     const cardHtml = `
       <div class="tool-approval-card" data-approval-id="${idAttr}" data-tool-key="${toolKeyAttr}" data-status="pending" role="group" aria-label="Tool approval required">
-        <div class="tool-approval-card__header">
+        <div class="tool-approval-card__row">
           <span class="tool-approval-card__icon" aria-hidden="true">!</span>
-          <div class="tool-approval-card__titles">
-            <div class="tool-approval-card__title">
-              Approve <code>${Utils.escapeHtml(toolName)}</code>?
-            </div>
-            <div class="tool-approval-card__meta">
-              ${serverName ? `<span class="tool-approval-card__server">${Utils.escapeHtml(serverName)}</span>` : ''}
-              <span class="tool-approval-card__sensitivity tool-approval-card__sensitivity--${Utils.escapeAttr(sensitivity)}">${Utils.escapeHtml(sensitivity)}</span>
-            </div>
-          </div>
-        </div>
-        <details class="tool-approval-card__args">
-          <summary>Arguments</summary>
-          <pre><code>${Utils.escapeHtml(argsText)}</code></pre>
-        </details>
-        <label class="tool-approval-card__remember">
-          <input type="checkbox" class="tool-approval-card__remember-input" />
-          <span>Don't ask again for <code>${Utils.escapeHtml(toolName)}</code></span>
-        </label>
-        <div class="tool-approval-card__actions">
+          <span class="tool-approval-card__title">
+            <code>${Utils.escapeHtml(toolName)}</code>
+          </span>
+          <span class="tool-approval-card__sensitivity tool-approval-card__sensitivity--${Utils.escapeAttr(sensitivity)}">${Utils.escapeHtml(sensitivity)}</span>
+          ${serverName ? `<span class="tool-approval-card__server">${Utils.escapeHtml(serverName)}</span>` : ''}
+          <details class="tool-approval-card__args">
+            <summary aria-label="Show arguments">args</summary>
+            <pre><code>${Utils.escapeHtml(argsText)}</code></pre>
+          </details>
+          <label class="tool-approval-card__remember" title="Always allow this tool in future turns">
+            <input type="checkbox" class="tool-approval-card__remember-input" />
+            <span>always</span>
+          </label>
+          <span class="tool-approval-card__spacer"></span>
           <button type="button"
                   class="tool-approval-card__btn tool-approval-card__btn--deny"
                   onclick="Chat.handleToolApprovalDecision('${idAttr}', 'deny')">Deny</button>
@@ -3447,11 +3468,29 @@ const UI = {
   refreshApprovalModeIndicator() {
     const mode = Chat.getApprovalMode();
     document.querySelectorAll('[data-approval-mode-indicator]').forEach((el) => {
-      el.textContent = UI._approvalModeLabel(mode);
+      const label = el.querySelector('.approval-mode-bar__current');
+      if (label) label.textContent = UI._approvalModeLabel(mode);
+      else el.textContent = UI._approvalModeLabel(mode);
       el.dataset.mode = mode;
+    });
+    document.querySelectorAll('.approval-mode-bar').forEach((bar) => {
+      bar.dataset.mode = mode;
+    });
+    document.querySelectorAll('.approval-mode-bar__menu [data-approval-mode]').forEach((btn) => {
+      btn.setAttribute('aria-checked', btn.dataset.approvalMode === mode ? 'true' : 'false');
+      btn.classList.toggle('is-active', btn.dataset.approvalMode === mode);
     });
     const radios = document.querySelectorAll('input[name="approval-mode"]');
     radios.forEach((r) => { r.checked = (r.value === mode); });
+  },
+
+  toggleApprovalModeMenu(open) {
+    const toggle = document.querySelector('[data-approval-mode-indicator]');
+    const menu = document.querySelector('.approval-mode-bar__menu');
+    if (!toggle || !menu) return;
+    const shouldOpen = (open === undefined) ? menu.hidden : open;
+    menu.hidden = !shouldOpen;
+    toggle.setAttribute('aria-expanded', shouldOpen ? 'true' : 'false');
   },
 
   _approvalModeLabel(mode) {

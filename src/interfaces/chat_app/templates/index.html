@@ -109,10 +109,42 @@
     <!-- Input -->
     <footer class="input-area">
       <div class="input-container">
-        <!-- Pending MCP tool approvals appear here, directly above the input
-             field. Lives INSIDE .input-container so it shares the same
-             centered max-width and the column flex direction — otherwise it
-             becomes a side-by-side flex sibling of the input wrapper. -->
+        <!-- Approval footer stack modeled on Cline's auto-approve bar +
+             action-buttons row (https://github.com/cline/cline). Compact,
+             pinned above the input, collapses when nothing is pending. -->
+        <div class="approval-mode-bar" aria-label="Tool permission mode">
+          <span class="approval-mode-bar__label">Permissions</span>
+          <div class="approval-mode-bar__picker">
+            <button type="button"
+                    class="approval-mode-bar__toggle"
+                    data-approval-mode-indicator
+                    aria-haspopup="menu"
+                    aria-expanded="false">
+              <span class="approval-mode-bar__current">Ask every time</span>
+              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" aria-hidden="true">
+                <polyline points="6 9 12 15 18 9"></polyline>
+              </svg>
+            </button>
+            <div class="approval-mode-bar__menu" role="menu" hidden>
+              <button type="button" role="menuitemradio" data-approval-mode="default">
+                <span class="approval-mode-bar__menu-label">Ask every time</span>
+                <span class="approval-mode-bar__menu-tag">default</span>
+              </button>
+              <button type="button" role="menuitemradio" data-approval-mode="acceptEdits">
+                <span class="approval-mode-bar__menu-label">Accept writes</span>
+                <span class="approval-mode-bar__menu-tag">acceptEdits</span>
+              </button>
+              <button type="button" role="menuitemradio" data-approval-mode="bypassPermissions">
+                <span class="approval-mode-bar__menu-label">Bypass all</span>
+                <span class="approval-mode-bar__menu-tag approval-mode-bar__menu-tag--warn">bypassPermissions</span>
+              </button>
+              <button type="button" role="menuitemradio" data-approval-mode="plan">
+                <span class="approval-mode-bar__menu-label">Plan (read-only)</span>
+                <span class="approval-mode-bar__menu-tag">plan</span>
+              </button>
+            </div>
+          </div>
+        </div>
         <div class="approval-tray" hidden aria-live="polite" aria-label="Pending tool approvals"></div>
         <div class="input-wrapper">
           <div class="input-left-controls">
