@@ -5109,8 +5109,9 @@ const Chat = {
       card.dataset.status = 'deciding';
       card.querySelectorAll('.tool-approval-card__btn').forEach((b) => { b.disabled = true; });
     }
+    let result;
     try {
-      const result = await API.decideToolApproval(approvalId, decision);
+      result = await API.decideToolApproval(approvalId, decision);
       UI.updateToolApprovalCard(approvalId, {
         status: result?.status || (decision === 'approve' ? 'approved' : 'denied'),
         decidedBy: result?.decided_by || 'you',
@@ -5118,7 +5119,30 @@ const Chat = {
     } catch (e) {
       UI.updateToolApprovalCard(approvalId, { status: 'pending' });
       UI.showToast(`Failed to ${decision} tool: ${e?.message || 'unknown error'}`);
+      return;
     }
+
+    // Recording the decision only updates the DB row — the agent's
+    // current turn already finished by returning "awaiting approval"
+    // to the LLM. To actually run the tool, the agent needs another
+    // turn, where the MCP guardrail will see the approved decision and
+    // execute. Auto-send a small follow-up nudge so the user doesn't
+    // have to do this manually.
+    const finalStatus = result?.status || (decision === 'approve' ? 'approved' : 'denied');
+    if (finalStatus === 'approved' && !this.state.isStreaming) {
+      const toolLabel = result?.tool_name || 'the previously requested tool';
+      this.sendFollowUp(`Approval granted — please proceed with ${toolLabel}.`);
+    }
+  },
+
+  sendFollowUp(text) {
+    if (!text || this.state.isStreaming) return;
+    const input = UI.elements.inputField;
+    if (!input) return;
+    input.value = text;
+    // sendMessage() reads from the input and re-invokes the agent;
+    // the new turn picks up the approved decision via the DB.
+    this.sendMessage();
   },
 };
 
