@@ -53,7 +53,9 @@ langchain-community==0.4
 # DuckDuckGoSearchAPIWrapper in langchain-community>=0.3 imports from `ddgs`
 # (formerly `duckduckgo-search`); without this pin the web_search tool
 # crashes on startup with ModuleNotFoundError.
-ddgs==9.8.0
+# ddgs>=9.6.0 requires httpx>=0.28.1 which conflicts with the
+# httpx==0.27.2 pin above, so stay on the 9.5.x line (no httpx pin).
+ddgs==9.5.5
 langchain-core==1.2.13
 langchain-text-splitters==1.0.0
 langchain-huggingface==1.0.0
