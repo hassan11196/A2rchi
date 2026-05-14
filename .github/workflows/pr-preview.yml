@@ -48,6 +48,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install . || true
           pip install -r requirements/requirements-base.txt
+          # langgraph-prebuilt 1.0.9+ imports ExecutionInfo from
+          # langgraph.runtime, a symbol that only exists in langgraph 1.2+.
+          # With langgraph==1.0.2 pinned in requirements-base.txt, pip's
+          # resolver still picks langgraph-prebuilt==1.0.13, breaking the
+          # import chain at test collection time. Force the last 1.0.x
+          # release that doesn't require ExecutionInfo.
+          # See: ImportError: cannot import name 'ExecutionInfo'
+          #      from 'langgraph.runtime'
+          pip install --force-reinstall --no-deps langgraph-prebuilt==1.0.8
           pip install pytest
 
       - name: Run unit tests
