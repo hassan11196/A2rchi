@@ -62,6 +62,7 @@ class PostgresServiceFactory:
         self._config_service: Optional[ConfigService] = None
         self._conversation_service: Optional[ConversationService] = None
         self._document_selection_service: Optional[DocumentSelectionService] = None
+        self._tool_approval_service = None  # Optional["ToolApprovalService"]
     
     @classmethod
     def from_config(
@@ -216,7 +217,22 @@ class PostgresServiceFactory:
                 connection_pool=self.connection_pool,
             )
         return self._document_selection_service
-    
+
+    @property
+    def tool_approval_service(self):
+        """Get ToolApprovalService (lazy-initialized).
+
+        Imported lazily so the factory module doesn't take a hard dependency
+        on the guardrail subsystem at import time.
+        """
+        if self._tool_approval_service is None:
+            from src.utils.tool_approval_service import ToolApprovalService
+
+            self._tool_approval_service = ToolApprovalService(
+                connection_pool=self.connection_pool,
+            )
+        return self._tool_approval_service
+
     def close(self) -> None:
         """Close connection pool and cleanup resources."""
         if self._pool:
@@ -228,6 +244,7 @@ class PostgresServiceFactory:
         self._config_service = None
         self._conversation_service = None
         self._document_selection_service = None
+        self._tool_approval_service = None
     
     def __enter__(self) -> 'PostgresServiceFactory':
         """Context manager entry."""
