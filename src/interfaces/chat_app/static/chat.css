@@ -1025,7 +1025,8 @@ body {
   border-color: var(--accent);
 }
 
-.settings-btn {
+.settings-btn,
+.agent-info-btn {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1039,7 +1040,8 @@ body {
   transition: all var(--transition-fast);
 }
 
-.settings-btn:hover {
+.settings-btn:hover,
+.agent-info-btn:hover {
   background: var(--bg-tertiary);
   color: var(--text-primary);
 }
@@ -4231,6 +4233,22 @@ body {
 .agent-info-list {
   margin: 0;
   padding-left: 18px;
+}
+
+.agent-info-muted {
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+}
+
+.agent-info-tag {
+  display: inline-block;
+  padding: 1px 6px;
+  margin-left: 4px;
+  border-radius: 999px;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  letter-spacing: 0.02em;
 }
 
 .agent-info-prompt {

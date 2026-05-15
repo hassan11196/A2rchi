@@ -745,6 +745,7 @@ const UI = {
       agentDropdownLabel: document.querySelector('.agent-dropdown-label'),
       agentDropdownList: document.querySelector('.agent-dropdown-list'),
       agentDropdownAdd: document.querySelector('.agent-dropdown-add'),
+      agentInfoBtn: document.querySelector('.agent-info-btn'),
       agentInfoModal: document.querySelector('.agent-info-modal'),
       agentInfoBackdrop: document.querySelector('.agent-info-backdrop'),
       agentInfoClose: document.querySelector('.agent-info-close'),
@@ -862,6 +863,9 @@ const UI = {
       }
     });
 
+    this.elements.agentInfoBtn?.addEventListener('click', () => {
+      this.openAgentInfo();
+    });
     this.elements.agentInfoBackdrop?.addEventListener('click', () => {
       this.closeAgentInfo();
     });
@@ -1153,6 +1157,7 @@ const UI = {
     if (sectionId === 'permissions') {
       this.refreshApprovalModeIndicator();
       this.refreshAlwaysAllowedToolsList();
+    } else if (sectionId === 'history') {
       this.refreshApprovalHistory();
     }
   },
@@ -1274,7 +1279,8 @@ const UI = {
       const embeddingLabel = info?.embedding_name || 'Not specified';
       const sources = Array.isArray(info?.data_sources) ? info.data_sources : [];
       const tools = Array.isArray(info?.agent_tools) ? info.agent_tools : [];
-      const prompt = info?.agent_prompt || '';
+      const mcpEnabled = !!info?.mcp_enabled;
+      const mcpServers = Array.isArray(info?.mcp_servers) ? info.mcp_servers : [];
 
       const sourcesHtml = sources.length
         ? `<ul class="agent-info-list">${sources.map(source => `<li>${Utils.escapeHtml(source)}</li>`).join('')}</ul>`
@@ -1283,6 +1289,20 @@ const UI = {
       const toolsHtml = tools.length
         ? `<ul class="agent-info-list">${tools.map(tool => `<li>${Utils.escapeHtml(tool)}</li>`).join('')}</ul>`
         : '<p>No tools configured.</p>';
+
+      let mcpHtml;
+      if (!mcpEnabled) {
+        mcpHtml = '<p>MCP not enabled for this agent (add <code>mcp</code> to its tools).</p>';
+      } else if (!mcpServers.length) {
+        mcpHtml = '<p>MCP enabled, but no MCP servers configured for this deployment.</p>';
+      } else {
+        mcpHtml = `<ul class="agent-info-list">${mcpServers.map(s => {
+          const name = Utils.escapeHtml(s?.name || '');
+          const transport = s?.transport ? Utils.escapeHtml(s.transport) : 'unknown';
+          const sso = s?.sso_auth ? ' <span class="agent-info-tag">SSO</span>' : '';
+          return `<li><code>${name}</code> <span class="agent-info-muted">(${transport})</span>${sso}</li>`;
+        }).join('')}</ul>`;
+      }
 
       this.elements.agentInfoContent.innerHTML = `
         <div class="agent-info-section">
@@ -1310,8 +1330,8 @@ const UI = {
           ${toolsHtml}
         </div>
         <div class="agent-info-section">
-          <h4>Prompt</h4>
-          <pre class="agent-info-prompt">${Utils.escapeHtml(prompt)}</pre>
+          <h4>MCP servers</h4>
+          ${mcpHtml}
         </div>`;
     } catch (e) {
       console.error('Failed to load agent info:', e);

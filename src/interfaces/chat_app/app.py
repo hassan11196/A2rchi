@@ -4448,14 +4448,29 @@ class FlaskAppWrapper(object):
         source_names = list(sources.keys()) if isinstance(sources, dict) else []
         agent_spec = getattr(self.chat, "agent_spec", None)
 
+        agent_tools = getattr(agent_spec, "tools", None) or []
+        mcp_enabled = "mcp" in agent_tools
+        # Surface only non-sensitive metadata — command/args/env/headers can carry secrets.
+        mcp_servers_raw = config_payload.get("mcp_servers") or {}
+        mcp_servers = [
+            {
+                "name": name,
+                "transport": (cfg or {}).get("transport"),
+                "sso_auth": bool((cfg or {}).get("sso_auth", False)),
+            }
+            for name, cfg in mcp_servers_raw.items()
+        ] if isinstance(mcp_servers_raw, dict) else []
+
         return jsonify({
             "config_name": config_name,
             "pipeline": agent_class,
             "embedding_name": embedding_name,
             "data_sources": source_names,
             "agent_name": getattr(agent_spec, "name", None),
-            "agent_tools": getattr(agent_spec, "tools", None),
+            "agent_tools": agent_tools,
             "agent_prompt": getattr(agent_spec, "prompt", None),
+            "mcp_enabled": mcp_enabled,
+            "mcp_servers": mcp_servers,
         }), 200
 
     def get_provider_models(self):
