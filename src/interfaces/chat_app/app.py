@@ -2440,6 +2440,13 @@ class ChatWrapper:
                 )
             yield {"type": "error", "status": 403, "message": "conversation not found"}
         except Exception as exc:
+            # Detect OpenAI's per-message string-too-long 400 so we can surface
+                # a meaningful error to the UI instead of a generic 500.  Matched
+                # by class name + code to avoid importing openai at this layer.
+            is_oversized_message = (
+                type(exc).__name__ == "BadRequestError"
+                and getattr(exc, "code", None) == "string_above_max_length"
+            )
             logger.error("Failed to stream response: %s", exc, exc_info=True)
             if trace_id:
                 self.update_agent_trace(
@@ -2449,7 +2456,17 @@ class ChatWrapper:
                     cancelled_by='system',
                     cancellation_reason=str(exc),
                 )
-            yield {"type": "error", "status": 500, "message": "server error; see chat logs for message"}
+            if is_oversized_message:
+                yield {
+                    "type": "error",
+                    "status": 413,
+                    "message": (
+                        "A tool response was too large for the model's per-message limit. "
+                        "Try a narrower query or one that returns fewer results."
+                    ),
+                }
+            else:
+                yield {"type": "error", "status": 500, "message": "server error; see chat logs for message"}
         finally:
             if self.cursor is not None:
                 self.cursor.close()

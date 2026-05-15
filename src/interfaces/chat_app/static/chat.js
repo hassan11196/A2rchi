@@ -5466,8 +5466,10 @@ const Chat = {
     // have to do this manually.
     const finalStatus = result?.status || (decision === 'approve' ? 'approved' : 'denied');
     if (finalStatus === 'approved' && !this.state.isStreaming) {
-      const toolLabel = result?.tool_name || 'the previously requested tool';
-      this.sendFollowUp(`Approval granted — please proceed with ${toolLabel}.`);
+      // Generic wording: the guardrail's consume-on-next-turn lookup matches
+      // by exact tool name, so naming the tool here doesn't matter — and it
+      // reads naturally even if the LLM picks a sibling tool on retry.
+      this.sendFollowUp('Approval granted — please proceed with the previously requested action.');
     }
   },
 

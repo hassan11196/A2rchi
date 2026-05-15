@@ -614,13 +614,22 @@ CREATE TABLE IF NOT EXISTS tool_approvals (
     decided_at      TIMESTAMPTZ,
     decided_by      VARCHAR(200),
     expires_at      TIMESTAMPTZ NOT NULL,
-    source          VARCHAR(20) NOT NULL DEFAULT 'chat'
+    source          VARCHAR(20) NOT NULL DEFAULT 'chat',
+    consumed_at     TIMESTAMPTZ
 );
+
+-- Idempotent migration for volumes that pre-date the consumed_at column.
+ALTER TABLE tool_approvals ADD COLUMN IF NOT EXISTS consumed_at TIMESTAMPTZ;
 
 CREATE INDEX IF NOT EXISTS idx_tool_approvals_lookup
     ON tool_approvals (conversation_id, tool_name, args_hash, status);
 CREATE INDEX IF NOT EXISTS idx_tool_approvals_status_expires
     ON tool_approvals (status, expires_at);
+-- Partial index powering the consume-on-next-turn lookup; only approved-and-
+-- unconsumed rows are eligible, so the index stays tiny.
+CREATE INDEX IF NOT EXISTS idx_tool_approvals_unconsumed
+    ON tool_approvals (conversation_id, tool_name)
+    WHERE status = 'approved' AND consumed_at IS NULL;
 
 -- ============================================================================
 -- 8. A/B COMPARISON TRACKING

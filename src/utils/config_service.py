@@ -360,9 +360,15 @@ class ConfigService:
                         decided_at      TIMESTAMPTZ,
                         decided_by      VARCHAR(200),
                         expires_at      TIMESTAMPTZ NOT NULL,
-                        source          VARCHAR(20) NOT NULL DEFAULT 'chat'
+                        source          VARCHAR(20) NOT NULL DEFAULT 'chat',
+                        consumed_at     TIMESTAMPTZ
                     )
                     """
+                )
+                # Idempotent migration for volumes that pre-date consumed_at.
+                cursor.execute(
+                    "ALTER TABLE tool_approvals "
+                    "ADD COLUMN IF NOT EXISTS consumed_at TIMESTAMPTZ"
                 )
                 cursor.execute(
                     "CREATE INDEX IF NOT EXISTS idx_tool_approvals_lookup "
@@ -371,6 +377,12 @@ class ConfigService:
                 cursor.execute(
                     "CREATE INDEX IF NOT EXISTS idx_tool_approvals_status_expires "
                     "ON tool_approvals (status, expires_at)"
+                )
+                # Partial index powering the consume-on-next-turn lookup.
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tool_approvals_unconsumed "
+                    "ON tool_approvals (conversation_id, tool_name) "
+                    "WHERE status = 'approved' AND consumed_at IS NULL"
                 )
                 # user_actions — write-operation audit timeline.
                 cursor.execute(

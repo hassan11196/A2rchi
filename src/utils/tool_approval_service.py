@@ -53,9 +53,15 @@ CREATE TABLE IF NOT EXISTS tool_approvals (
     decided_at      TIMESTAMPTZ,
     decided_by      VARCHAR(200),
     expires_at      TIMESTAMPTZ NOT NULL,
-    source          VARCHAR(20) NOT NULL DEFAULT 'chat'
+    source          VARCHAR(20) NOT NULL DEFAULT 'chat',
+    consumed_at     TIMESTAMPTZ
 );
 """
+
+# Idempotent migration for existing deployments that pre-date `consumed_at`.
+SQL_MIGRATE_ADD_CONSUMED_AT = (
+    "ALTER TABLE tool_approvals ADD COLUMN IF NOT EXISTS consumed_at TIMESTAMPTZ"
+)
 
 SQL_INDEX_TOOL_APPROVALS_LOOKUP = (
     "CREATE INDEX IF NOT EXISTS idx_tool_approvals_lookup "
@@ -64,6 +70,13 @@ SQL_INDEX_TOOL_APPROVALS_LOOKUP = (
 SQL_INDEX_TOOL_APPROVALS_STATUS = (
     "CREATE INDEX IF NOT EXISTS idx_tool_approvals_status_expires "
     "ON tool_approvals (status, expires_at)"
+)
+# Partial index for the consume-on-next-turn lookup. Only approved-and-unconsumed
+# rows are eligible, so the index stays tiny even with thousands of historical rows.
+SQL_INDEX_TOOL_APPROVALS_UNCONSUMED = (
+    "CREATE INDEX IF NOT EXISTS idx_tool_approvals_unconsumed "
+    "ON tool_approvals (conversation_id, tool_name) "
+    "WHERE status = 'approved' AND consumed_at IS NULL"
 )
 
 
@@ -86,6 +99,7 @@ class ToolApproval:
     decided_by: Optional[str]
     expires_at: datetime
     source: str
+    consumed_at: Optional[datetime] = None
 
     @property
     def is_terminal(self) -> bool:
@@ -99,6 +113,37 @@ def hash_tool_args(tool_args: Any) -> str:
     except Exception:
         canonical = repr(tool_args)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+
+
+def _format_decided_tool_message(
+    *,
+    decision: ApprovalStatus,
+    approval_id: str,
+    tool_name: str,
+    sensitivity: str,
+) -> str:
+    """Build replacement text for the placeholder ``agent_tool_calls`` row.
+
+    Mirrors the shape of ``BaseReActAgent._pending_message`` (same keys, same
+    quoting) so any UI that parses ``approval_id=...`` keeps working; only the
+    leading clause and trailing instruction change.
+    """
+    if decision == "approved":
+        verb = "approved by user"
+        tail = (
+            "Tool will be executed with the user-approved arguments on the "
+            "next chat turn."
+        )
+    else:
+        verb = "denied by user"
+        tail = "The tool was NOT executed."
+    return (
+        f"Tool call {verb}. "
+        f"approval_id={approval_id!r}, "
+        f"tool={tool_name!r}, "
+        f"sensitivity={sensitivity!r}. "
+        f"{tail}"
+    )
 
 
 class ToolApprovalService:
@@ -142,8 +187,11 @@ class ToolApprovalService:
         try:
             with conn.cursor() as cur:
                 cur.execute(SQL_CREATE_TOOL_APPROVALS_TABLE)
+                # Migrate older deployments that don't have consumed_at yet.
+                cur.execute(SQL_MIGRATE_ADD_CONSUMED_AT)
                 cur.execute(SQL_INDEX_TOOL_APPROVALS_LOOKUP)
                 cur.execute(SQL_INDEX_TOOL_APPROVALS_STATUS)
+                cur.execute(SQL_INDEX_TOOL_APPROVALS_UNCONSUMED)
             conn.commit()
         finally:
             self._release_connection(conn)
@@ -164,7 +212,8 @@ class ToolApprovalService:
                     """
                     SELECT approval_id, conversation_id, message_id, user_id, server_name,
                            tool_name, tool_args, args_hash, sensitivity, status,
-                           requested_at, decided_at, decided_by, expires_at, source
+                           requested_at, decided_at, decided_by, expires_at, source,
+                           consumed_at
                     FROM tool_approvals
                     WHERE conversation_id IS NOT DISTINCT FROM %s
                       AND tool_name = %s
@@ -181,6 +230,66 @@ class ToolApprovalService:
         finally:
             self._release_connection(conn)
 
+    def find_unconsumed_approved(
+        self,
+        *,
+        conversation_id: Optional[int],
+        tool_name_candidates: List[str],
+    ) -> Optional[ToolApproval]:
+        """Most recent approved-but-unconsumed row matching any candidate tool_name.
+
+        Used by the MCP guardrail's "consume-on-next-turn" path: when the LLM
+        re-issues an approved write tool with drifted args (different
+        formatting, optional fields, etc.), the exact-hash ``find_decision``
+        misses, but this lookup still finds the row the user actually approved
+        so the call can proceed using the *stored* args.
+        """
+        if not tool_name_candidates:
+            return None
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT approval_id, conversation_id, message_id, user_id, server_name,
+                           tool_name, tool_args, args_hash, sensitivity, status,
+                           requested_at, decided_at, decided_by, expires_at, source,
+                           consumed_at
+                    FROM tool_approvals
+                    WHERE conversation_id IS NOT DISTINCT FROM %s
+                      AND tool_name = ANY(%s)
+                      AND status = 'approved'
+                      AND consumed_at IS NULL
+                    ORDER BY decided_at DESC
+                    LIMIT 1
+                    """,
+                    (conversation_id, list(tool_name_candidates)),
+                )
+                row = cur.fetchone()
+                return _row_to_approval(row) if row else None
+        finally:
+            self._release_connection(conn)
+
+    def mark_consumed(self, approval_id: str) -> bool:
+        """Atomically mark an approval consumed. True iff this caller won the race."""
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE tool_approvals
+                    SET consumed_at = NOW()
+                    WHERE approval_id = %s AND consumed_at IS NULL
+                    RETURNING approval_id
+                    """,
+                    (approval_id,),
+                )
+                row = cur.fetchone()
+            conn.commit()
+            return row is not None
+        finally:
+            self._release_connection(conn)
+
     def get(self, approval_id: str) -> Optional[ToolApproval]:
         conn = self._get_connection()
         try:
@@ -189,7 +298,8 @@ class ToolApprovalService:
                     """
                     SELECT approval_id, conversation_id, message_id, user_id, server_name,
                            tool_name, tool_args, args_hash, sensitivity, status,
-                           requested_at, decided_at, decided_by, expires_at, source
+                           requested_at, decided_at, decided_by, expires_at, source,
+                           consumed_at
                     FROM tool_approvals
                     WHERE approval_id = %s
                     """,
@@ -269,7 +379,13 @@ class ToolApprovalService:
         decision: ApprovalStatus,
         decided_by: Optional[str] = None,
     ) -> Optional[ToolApproval]:
-        """Mark a pending approval as ``approved`` or ``denied``."""
+        """Mark a pending approval as ``approved`` or ``denied``.
+
+        Also rewrites the placeholder text in ``agent_tool_calls.tool_result``
+        for any prior turn that recorded "awaiting user approval" against this
+        ``approval_id``, so the chat history reflects the decision immediately
+        instead of after the next agent re-run.
+        """
         if decision not in ("approved", "denied"):
             raise ValueError(f"Invalid decision: {decision!r}")
         now = datetime.now(timezone.utc)
@@ -285,11 +401,28 @@ class ToolApprovalService:
                     WHERE approval_id = %s
                       AND status = 'pending'
                       AND expires_at > NOW()
-                    RETURNING approval_id
+                    RETURNING conversation_id, tool_name, sensitivity
                     """,
                     (decision, now, decided_by, approval_id),
                 )
                 row = cur.fetchone()
+                if row is not None:
+                    conv_id, tool_name, sensitivity = row
+                    new_content = _format_decided_tool_message(
+                        decision=decision,
+                        approval_id=approval_id,
+                        tool_name=tool_name,
+                        sensitivity=sensitivity,
+                    )
+                    cur.execute(
+                        """
+                        UPDATE agent_tool_calls
+                        SET tool_result = %s
+                        WHERE conversation_id = %s
+                          AND tool_result LIKE %s
+                        """,
+                        (new_content, conv_id, f"%approval_id='{approval_id}'%"),
+                    )
             conn.commit()
         finally:
             self._release_connection(conn)
@@ -410,7 +543,8 @@ class ToolApprovalService:
                     f"""
                     SELECT approval_id, conversation_id, message_id, user_id, server_name,
                            tool_name, tool_args, args_hash, sensitivity, status,
-                           requested_at, decided_at, decided_by, expires_at, source
+                           requested_at, decided_at, decided_by, expires_at, source,
+                           consumed_at
                     FROM tool_approvals
                     {where}
                     ORDER BY requested_at DESC
@@ -445,7 +579,8 @@ class ToolApprovalService:
 def _row_to_approval(row) -> ToolApproval:
     (approval_id, conversation_id, message_id, user_id, server_name,
      tool_name, tool_args, args_hash, sensitivity, status,
-     requested_at, decided_at, decided_by, expires_at, source) = row
+     requested_at, decided_at, decided_by, expires_at, source,
+     consumed_at) = row
     return ToolApproval(
         approval_id=approval_id,
         conversation_id=conversation_id,
@@ -462,4 +597,5 @@ def _row_to_approval(row) -> ToolApproval:
         decided_by=decided_by,
         expires_at=expires_at,
         source=source,
+        consumed_at=consumed_at,
     )

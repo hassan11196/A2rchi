@@ -170,7 +170,7 @@ body {
 .app {
   display: grid;
   grid-template-columns: var(--sidebar-width) 1fr;
-  grid-template-rows: var(--header-height) 1fr var(--input-height);
+  grid-template-rows: var(--header-height) 1fr auto;
   grid-template-areas:
     "sidebar header"
     "sidebar messages"
@@ -939,6 +939,7 @@ body {
   padding: 12px 24px 16px;
   background: var(--bg-primary);
   border-top: 1px solid var(--border-color);
+  min-height: var(--input-height);
 }
 
 .input-container {
@@ -3662,7 +3663,6 @@ body {
   flex-direction: column;
   gap: 6px;
   width: 100%;
-  margin-bottom: 6px;
   max-height: 30vh;
   overflow-y: auto;
 }

@@ -20,10 +20,27 @@ from src.archi.providers.base import ProviderType
 from src.archi.utils.output_dataclass import PipelineOutput
 from src.archi.pipelines.agents.utils.run_memory import RunMemory
 from src.archi.pipelines.agents.utils.mcp_utils import AsyncLoopThread
+from src.archi.pipelines.agents.utils.context_condensation import truncate_tool_output
+from src.archi.pipelines.agents.middleware import ContextWindowMiddleware
 from src.archi.pipelines.agents.tools import initialize_mcp_client
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+class _ApprovedExec:
+    """Sentinel returned by the MCP guardrail when a previously-approved row
+    is being consumed for this call. Tells ``sync_wrapper`` to run the tool
+    with the user-approved args (stored on the approval row) rather than the
+    LLM's regenerated args, which may have drifted since the user clicked
+    Approve.
+    """
+    __slots__ = ("approval_id", "args")
+
+    def __init__(self, approval_id: str, args: Dict[str, Any]):
+        self.approval_id = approval_id
+        self.args = args
+
 
 class BaseReActAgent:
     """
@@ -1286,6 +1303,14 @@ class BaseReActAgent:
                         server_name=server_name,
                         tool_args=recorded,
                     )
+                    if isinstance(guard_msg, _ApprovedExec):
+                        # User approved this exact tool earlier in the conversation.
+                        # Run it with the args the user actually saw on the approval
+                        # card — not the LLM's regenerated args, which may have drifted.
+                        return truncate_tool_output(
+                            runner.run(async_tool.coroutine(**guard_msg.args)),
+                            tool_name=tool_name,
+                        )
                     if guard_msg is not None:
                         # Tool is registered with response_format='content_and_artifact',
                         # so langchain requires a (content, artifact) tuple even for
@@ -1294,7 +1319,10 @@ class BaseReActAgent:
                         return guard_msg, None
 
                     # Run on the background loop - NOT a new loop!
-                    return runner.run(async_tool.coroutine(*args, **kwargs))
+                    return truncate_tool_output(
+                        runner.run(async_tool.coroutine(*args, **kwargs)),
+                        tool_name=tool_name,
+                    )
 
                 # Assign the wrapper to the tool's 'func' attribute
                 async_tool.func = sync_wrapper
@@ -1455,6 +1483,23 @@ class BaseReActAgent:
             )
             return None
 
+        # Consume-on-next-turn: if the user already approved this exact tool
+        # name in this conversation but the LLM is now retrying with drifted
+        # args (different formatting, optional fields, etc.), fall back to the
+        # most-recent approved-and-unconsumed row for this (conversation, tool)
+        # and run the tool with the args the user actually saw + approved.
+        # mark_consumed is atomic so concurrent agent runs cannot double-consume.
+        preapproved = service.find_unconsumed_approved(
+            conversation_id=self._current_conversation_id,
+            tool_name_candidates=[tool_name],  # exact tool_name match — no aliases
+        )
+        if preapproved and service.mark_consumed(preapproved.approval_id):
+            logger.info(
+                "MCP guardrail: %s consuming approval=%s (running with user-approved args)",
+                tool_name, preapproved.approval_id,
+            )
+            return _ApprovedExec(preapproved.approval_id, dict(preapproved.tool_args or {}))
+
         args_hash = hash_tool_args(tool_args)
         existing = service.find_decision(
             conversation_id=self._current_conversation_id,
@@ -1530,8 +1575,23 @@ class BaseReActAgent:
         )
 
     def _build_static_middleware(self) -> List[Callable]:
-        """Build and returns static middleware defined in the config."""
-        return []
+        """Build and returns static middleware defined in the config.
+
+        Includes ContextWindowMiddleware by default to condense oversized tool
+        results before each LLM call, preventing the OpenAI 400
+        ``string_above_max_length`` failure mode caused by a single tool
+        response exceeding the per-message 10 MB cap.
+        """
+        middleware: List[Callable] = []
+        context_window = self._get_model_context_window()
+        if isinstance(context_window, int) and context_window > 0:
+            middleware.append(
+                ContextWindowMiddleware(
+                    llm=self.agent_llm,
+                    context_window=context_window,
+                )
+            )
+        return middleware
 
     def _store_documents(self, stage: str, docs: Sequence[Document]) -> None:
         """Centralised helper used by tools to record documents into the active memory."""
