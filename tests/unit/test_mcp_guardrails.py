@@ -142,8 +142,12 @@ class FakeCursor:
     def execute(self, sql: str, params: Optional[tuple] = None) -> None:
         sql_norm = " ".join(sql.split()).upper()
         params = params or ()
-        # SELECT current row by full lookup
-        if sql_norm.startswith("SELECT APPROVAL_ID, CONVERSATION_ID, MESSAGE_ID, USER_ID, SERVER_NAME, TOOL_NAME, TOOL_ARGS, ARGS_HASH, SENSITIVITY, STATUS, REQUESTED_AT, DECIDED_AT, DECIDED_BY, EXPIRES_AT, SOURCE FROM TOOL_APPROVALS WHERE CONVERSATION_ID IS NOT DISTINCT FROM"):
+        # Migration shim — service does ALTER TABLE ... ADD COLUMN IF NOT EXISTS
+        # consumed_at on first connect; no-op for the in-memory store.
+        if sql_norm.startswith("ALTER TABLE TOOL_APPROVALS"):
+            return
+        # SELECT current row by full lookup (now includes consumed_at column)
+        if sql_norm.startswith("SELECT APPROVAL_ID, CONVERSATION_ID, MESSAGE_ID, USER_ID, SERVER_NAME, TOOL_NAME, TOOL_ARGS, ARGS_HASH, SENSITIVITY, STATUS, REQUESTED_AT, DECIDED_AT, DECIDED_BY, EXPIRES_AT, SOURCE, CONSUMED_AT FROM TOOL_APPROVALS WHERE CONVERSATION_ID IS NOT DISTINCT FROM"):
             conv_id, tool_name, args_hash = params
             now = datetime.now(timezone.utc)
             matches = [
@@ -158,7 +162,7 @@ class FakeCursor:
             self._last_result = _row_tuple(matches[0]) if matches else None
             return
         # SELECT by approval_id
-        if sql_norm.startswith("SELECT APPROVAL_ID, CONVERSATION_ID, MESSAGE_ID, USER_ID, SERVER_NAME, TOOL_NAME, TOOL_ARGS, ARGS_HASH, SENSITIVITY, STATUS, REQUESTED_AT, DECIDED_AT, DECIDED_BY, EXPIRES_AT, SOURCE FROM TOOL_APPROVALS WHERE APPROVAL_ID"):
+        if sql_norm.startswith("SELECT APPROVAL_ID, CONVERSATION_ID, MESSAGE_ID, USER_ID, SERVER_NAME, TOOL_NAME, TOOL_ARGS, ARGS_HASH, SENSITIVITY, STATUS, REQUESTED_AT, DECIDED_AT, DECIDED_BY, EXPIRES_AT, SOURCE, CONSUMED_AT FROM TOOL_APPROVALS WHERE APPROVAL_ID"):
             (aid,) = params
             matches = [r for r in self._store if r["approval_id"] == aid]
             self._last_result = _row_tuple(matches[0]) if matches else None
@@ -177,6 +181,7 @@ class FakeCursor:
             row["status"] = "pending"
             row["decided_at"] = None
             row["decided_by"] = None
+            row["consumed_at"] = None
             self._store.append(row)
             self._last_result = None
             return
@@ -205,7 +210,16 @@ class FakeCursor:
                     r["decided_by"] = decided_by
                     updated = r
                     break
-            self._last_result = (approval_id,) if updated else None
+            self._last_result = (
+                (updated["conversation_id"], updated["tool_name"], updated["sensitivity"])
+                if updated else None
+            )
+            return
+        # decide() emits a follow-up UPDATE on agent_tool_calls to rewrite the
+        # awaiting-approval message into a decided message.  The fake doesn't
+        # model that table, so just no-op.
+        if sql_norm.startswith("UPDATE AGENT_TOOL_CALLS SET TOOL_RESULT"):
+            self._last_result = None
             return
         if sql_norm.startswith("CREATE TABLE") or sql_norm.startswith("CREATE INDEX"):
             return
@@ -227,6 +241,7 @@ def _row_tuple(row: dict) -> tuple:
         row["server_name"], row["tool_name"], row["tool_args"], row["args_hash"],
         row["sensitivity"], row["status"], row["requested_at"], row["decided_at"],
         row["decided_by"], row["expires_at"], row["source"],
+        row.get("consumed_at"),
     )
 
 
