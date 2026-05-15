@@ -79,7 +79,7 @@ class DocumentSelectionService:
     def _get_connection(self) -> psycopg2.extensions.connection:
         """Get a database connection."""
         if self._pool:
-            return self._pool.get_connection()
+            return self._pool.get_connection_direct()
         elif self._pg_config:
             return psycopg2.connect(**self._pg_config)
         else:

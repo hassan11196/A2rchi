@@ -593,7 +593,12 @@ class MattermostAIWrapper:
         self, history: List[Tuple[str, str]], user_id: Optional[str] = None
     ) -> str:
         """Call archi with explicit multi-turn history. Returns answer string."""
-        answer = self.archi(history=history, user_id=user_id)["answer"]
+        # Force plan mode: Mattermost has no UI to display approval cards and
+        # no per-conversation persistence to support the consume-on-next-turn
+        # flow, so write/execute tools cannot be safely surfaced here. The
+        # guardrail will auto-deny those with a message the user can read in
+        # the channel; safe (read-only) tools still work.
+        answer = self.archi(history=history, user_id=user_id, permission_mode="plan")["answer"]
         logger.debug('ANSWER = %s', answer)
         return answer
 
@@ -613,7 +618,10 @@ class MattermostAIWrapper:
         except Exception:
             pass
 
-        answer = self.archi(history=formatted_history, user_id=user_id)["answer"]
+        # See call_with_history above for the rationale on permission_mode="plan".
+        answer = self.archi(
+            history=formatted_history, user_id=user_id, permission_mode="plan",
+        )["answer"]
         logger.debug('ANSWER = %s', answer)
         return answer, post_str
 

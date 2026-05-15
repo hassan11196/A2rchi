@@ -2166,6 +2166,8 @@ class ChatWrapper:
         model: str = None,
         provider_api_key: str = None,
         user_id: Optional[str] = None,
+        permission_mode: str = "default",
+        allowed_tools: Optional[List[str]] = None,
     ) -> Iterator[Dict[str, Any]]:
         timestamps = self._init_timestamps()
         context = None
@@ -2231,7 +2233,30 @@ class ChatWrapper:
                 pipeline_name=self.archi.pipeline_name if hasattr(self.archi, 'pipeline_name') else None,
             )
 
-            for output in self.archi.stream(history=context.history, conversation_id=context.conversation_id, user_id=user_id, model=context.model_used):
+            # MCP tool-approval events fire from inside the tool-execution
+            # thread (which is the same thread as this stream loop, since
+            # archi.stream() is synchronous).  We accumulate them in a list
+            # and drain the list after each agent yield so they reach the
+            # client interleaved with the agent's regular output.
+            pending_approval_events: List[Dict[str, Any]] = []
+
+            def _approval_notifier(payload: Dict[str, Any]) -> None:
+                pending_approval_events.append({
+                    "type": "tool_approval_request",
+                    **payload,
+                })
+
+            for output in self.archi.stream(
+                history=context.history,
+                conversation_id=context.conversation_id,
+                user_id=user_id,
+                model=context.model_used,
+                approval_notifier=_approval_notifier,
+                permission_mode=permission_mode,
+                allowed_tools=allowed_tools or [],
+            ):
+                while pending_approval_events:
+                    yield pending_approval_events.pop(0)
                 if client_timeout and time.time() - stream_start_time > client_timeout:
                     if trace_id:
                         total_duration_ms = int((time.time() - stream_start_time) * 1000)
@@ -2415,6 +2440,13 @@ class ChatWrapper:
                 )
             yield {"type": "error", "status": 403, "message": "conversation not found"}
         except Exception as exc:
+            # Detect OpenAI's per-message string-too-long 400 so we can surface
+                # a meaningful error to the UI instead of a generic 500.  Matched
+                # by class name + code to avoid importing openai at this layer.
+            is_oversized_message = (
+                type(exc).__name__ == "BadRequestError"
+                and getattr(exc, "code", None) == "string_above_max_length"
+            )
             logger.error("Failed to stream response: %s", exc, exc_info=True)
             if trace_id:
                 self.update_agent_trace(
@@ -2424,7 +2456,17 @@ class ChatWrapper:
                     cancelled_by='system',
                     cancellation_reason=str(exc),
                 )
-            yield {"type": "error", "status": 500, "message": "server error; see chat logs for message"}
+            if is_oversized_message:
+                yield {
+                    "type": "error",
+                    "status": 413,
+                    "message": (
+                        "A tool response was too large for the model's per-message limit. "
+                        "Try a narrower query or one that returns fewer results."
+                    ),
+                }
+            else:
+                yield {"type": "error", "status": 500, "message": "server error; see chat logs for message"}
         finally:
             if self.cursor is not None:
                 self.cursor.close()
@@ -2505,6 +2547,10 @@ class FlaskAppWrapper(object):
         # create the chat from the wrapper and ensure default config is active
         self.chat = ChatWrapper()
         self.chat.update_config(config_name=self.config["name"])
+        # Expose the chat wrapper on the Flask app so the API blueprint can
+        # reach it through current_app without us having to refactor it into
+        # a fully shared service.
+        self.app.chat_wrapper = self.chat
 
         # enable CORS:
         CORS(self.app)
@@ -4402,14 +4448,29 @@ class FlaskAppWrapper(object):
         source_names = list(sources.keys()) if isinstance(sources, dict) else []
         agent_spec = getattr(self.chat, "agent_spec", None)
 
+        agent_tools = getattr(agent_spec, "tools", None) or []
+        mcp_enabled = "mcp" in agent_tools
+        # Surface only non-sensitive metadata — command/args/env/headers can carry secrets.
+        mcp_servers_raw = config_payload.get("mcp_servers") or {}
+        mcp_servers = [
+            {
+                "name": name,
+                "transport": (cfg or {}).get("transport"),
+                "sso_auth": bool((cfg or {}).get("sso_auth", False)),
+            }
+            for name, cfg in mcp_servers_raw.items()
+        ] if isinstance(mcp_servers_raw, dict) else []
+
         return jsonify({
             "config_name": config_name,
             "pipeline": agent_class,
             "embedding_name": embedding_name,
             "data_sources": source_names,
             "agent_name": getattr(agent_spec, "name", None),
-            "agent_tools": getattr(agent_spec, "tools", None),
+            "agent_tools": agent_tools,
             "agent_prompt": getattr(agent_spec, "prompt", None),
+            "mcp_enabled": mcp_enabled,
+            "mcp_servers": mcp_servers,
         }), 200
 
     def get_provider_models(self):
@@ -4904,6 +4965,15 @@ class FlaskAppWrapper(object):
         if isinstance(include_tool_steps, str):
             include_tool_steps = include_tool_steps.lower() == "true"
 
+        # MCP tool-approval mode and per-tool always-allow rules. Mirrors
+        # Claude Agent SDK's permission_mode + Claude Code's
+        # permissions.allow. Validation happens in the guardrail itself; the
+        # parser just normalizes shape (list of strings).
+        raw_allowed = payload.get("allowed_tools") or []
+        if not isinstance(raw_allowed, (list, tuple)):
+            raw_allowed = []
+        allowed_tools = [str(x) for x in raw_allowed if x]
+
         return {
             "message": payload.get("last_message"),
             "conversation_id": payload.get("conversation_id"),
@@ -4918,6 +4988,8 @@ class FlaskAppWrapper(object):
             "provider": payload.get("provider"),
             "model": payload.get("model"),
             "pipeline": payload.get("pipeline"),
+            "permission_mode": payload.get("permission_mode") or "default",
+            "allowed_tools": allowed_tools,
         }
 
 
@@ -5013,6 +5085,8 @@ class FlaskAppWrapper(object):
         include_tool_steps = request_data["include_tool_steps"]
         provider = request_data["provider"]
         model = request_data["model"]
+        permission_mode = request_data["permission_mode"]
+        allowed_tools = request_data["allowed_tools"]
 
         if not client_id:
             return jsonify({"error": "client_id missing"}), 400
@@ -5042,6 +5116,8 @@ class FlaskAppWrapper(object):
                 model=model,
                 provider_api_key=session_api_key,
                 user_id=user_id,
+                permission_mode=permission_mode,
+                allowed_tools=allowed_tools,
             ):
                 yield json.dumps(event, default=str) + "\n"
 
@@ -5159,9 +5235,12 @@ class FlaskAppWrapper(object):
 
         Query parameters:
         - limit (optional): Number of conversations to return (default: 50, max: 500)
+        - source (optional): Filter by archi_service — one of
+          ``all`` (default), ``chat``, ``mattermost``, ``api``.
 
         Returns:
-            JSON with list of conversations with fields: (conversation_id, title, created_at, last_message_at).
+            JSON with list of conversations with fields:
+            (conversation_id, title, created_at, last_message_at, archi_service).
         """
         try:
             client_id = request.args.get('client_id')
@@ -5169,6 +5248,12 @@ class FlaskAppWrapper(object):
             if not user_id and not client_id:
                 return jsonify({'error': 'client_id missing'}), 400
             limit = min(int(request.args.get('limit', 50)), 500)
+            source_filter = (request.args.get('source') or 'all').strip().lower()
+            if source_filter not in {'all', 'chat', 'mattermost', 'api'}:
+                return jsonify({
+                    'error': "Invalid 'source' query parameter; expected one of "
+                             "'all', 'chat', 'mattermost', 'api'."
+                }), 400
 
             # create connection to database
             conn = psycopg2.connect(**self.pg_config)
@@ -5184,12 +5269,15 @@ class FlaskAppWrapper(object):
 
             conversations = []
             for row in rows:
+                archi_service = row[4] if len(row) > 4 else 'chat'
+                if source_filter != 'all' and archi_service != source_filter:
+                    continue
                 conversations.append({
                     'conversation_id': row[0],
                     'title': row[1] or "New Chat",
                     'created_at': row[2].isoformat() if row[2] else None,
                     'last_message_at': row[3].isoformat() if row[3] else None,
-                    'archi_service': row[4] if len(row) > 4 else 'chat',
+                    'archi_service': archi_service,
                 })
 
             # clean up database connection state
@@ -5201,7 +5289,7 @@ class FlaskAppWrapper(object):
         except ValueError as e:
             return jsonify({'error': f'Invalid parameter: {str(e)}'}), 400
         except Exception as e:
-            print(f"ERROR in list_conversations: {str(e)}")
+            logger.error("Error in list_conversations: %s", e)
             return jsonify({'error': str(e)}), 500
 
     def load_conversation(self):

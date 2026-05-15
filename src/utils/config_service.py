@@ -342,6 +342,71 @@ class ConfigService:
                     "CREATE INDEX IF NOT EXISTS idx_mm_tokens_username "
                     "ON mattermost_tokens(mattermost_username)"
                 )
+                # MCP tool approvals (write/execute gate).
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS tool_approvals (
+                        approval_id     VARCHAR(64) PRIMARY KEY,
+                        conversation_id INTEGER,
+                        message_id      INTEGER,
+                        user_id         VARCHAR(200),
+                        server_name     VARCHAR(200) NOT NULL,
+                        tool_name       VARCHAR(200) NOT NULL,
+                        tool_args       JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        args_hash       VARCHAR(64) NOT NULL,
+                        sensitivity     VARCHAR(20) NOT NULL DEFAULT 'write',
+                        status          VARCHAR(20) NOT NULL DEFAULT 'pending',
+                        requested_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        decided_at      TIMESTAMPTZ,
+                        decided_by      VARCHAR(200),
+                        expires_at      TIMESTAMPTZ NOT NULL,
+                        source          VARCHAR(20) NOT NULL DEFAULT 'chat',
+                        consumed_at     TIMESTAMPTZ
+                    )
+                    """
+                )
+                # Idempotent migration for volumes that pre-date consumed_at.
+                cursor.execute(
+                    "ALTER TABLE tool_approvals "
+                    "ADD COLUMN IF NOT EXISTS consumed_at TIMESTAMPTZ"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tool_approvals_lookup "
+                    "ON tool_approvals (conversation_id, tool_name, args_hash, status)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tool_approvals_status_expires "
+                    "ON tool_approvals (status, expires_at)"
+                )
+                # Partial index powering the consume-on-next-turn lookup.
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tool_approvals_unconsumed "
+                    "ON tool_approvals (conversation_id, tool_name) "
+                    "WHERE status = 'approved' AND consumed_at IS NULL"
+                )
+                # user_actions — write-operation audit timeline.
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS user_actions (
+                        action_id   VARCHAR(64) PRIMARY KEY,
+                        user_id     VARCHAR(200),
+                        action_type VARCHAR(100) NOT NULL,
+                        target_kind VARCHAR(100),
+                        target_id   VARCHAR(200),
+                        payload     JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        source      VARCHAR(20) NOT NULL DEFAULT 'web',
+                        ts          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_user_actions_user_ts "
+                    "ON user_actions (user_id, ts DESC)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_user_actions_type_ts "
+                    "ON user_actions (action_type, ts DESC)"
+                )
                 conn.commit()
         except psycopg2.Error as e:
             logger.debug("Could not ensure config tables/columns: %s", e)

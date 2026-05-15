@@ -237,7 +237,18 @@ def update_user_preferences():
         
         if not user:
             return jsonify({'error': 'User not found'}), 404
-        
+
+        # Audit: record the preference change so it shows up in /api/users/me/actions.
+        _record_user_action(
+            user_id=g.client_id,
+            action_type="preferences_updated",
+            target_kind="user",
+            target_id=g.client_id,
+            payload={k: data.get(k) for k in (
+                "theme", "preferred_model", "preferred_temperature", "display_name",
+            ) if k in data},
+        )
+
         return jsonify({
             'id': user.id,
             'display_name': user.display_name,
@@ -247,7 +258,7 @@ def update_user_preferences():
             'ab_participation_rate': float(user.ab_participation_rate) if user.ab_participation_rate is not None else None,
             'updated_at': user.updated_at,
         }), 200
-        
+
     except Exception as e:
         logger.error(f"Error updating preferences: {e}")
         return jsonify({'error': str(e)}), 500
@@ -284,13 +295,21 @@ def set_api_key(provider: str):
             provider=provider,
             api_key=api_key,
         )
-        
+
+        _record_user_action(
+            user_id=g.client_id,
+            action_type="api_key_set",
+            target_kind="api_key",
+            target_id=provider,
+            payload={"provider": provider},
+        )
+
         return jsonify({
             'success': True,
             'provider': provider,
             'message': f'{provider} API key stored securely',
         }), 200
-        
+
     except Exception as e:
         logger.error(f"Error setting API key: {e}")
         return jsonify({'error': str(e)}), 500
@@ -318,7 +337,15 @@ def delete_api_key(provider: str):
             provider=provider,
             api_key=None,  # Setting to None deletes
         )
-        
+
+        _record_user_action(
+            user_id=g.client_id,
+            action_type="api_key_removed",
+            target_kind="api_key",
+            target_id=provider,
+            payload={"provider": provider},
+        )
+
         return jsonify({
             'success': True,
             'provider': provider,
@@ -1094,10 +1121,358 @@ def get_api_info():
     }), 200
 
 
+# ---------------------------------------------------------------------------
+# Chat — REST entry point for non-browser clients
+# ---------------------------------------------------------------------------
+
+@api.route('/chat', methods=['POST'])
+@require_client_id
+def post_chat_message():
+    """Synchronous chat endpoint for API clients.
+
+    Body:
+        {
+            "message": "<text>",
+            "conversation_id": <int|null>,    // omit / null to start fresh
+            "config_name": "<deployment>",    // optional, falls back to active
+            "client_timeout": <seconds>       // optional, default 60s, max 300s
+        }
+
+    Returns:
+        {
+            "answer": "...",
+            "conversation_id": <int>,
+            "archi_service": "api",
+            "message_ids": [user_id, assistant_id]
+        }
+
+    Auth: relies on session cookie or X-Client-ID header (same convention as
+    the rest of /api/*).  Marks the conversation_metadata row with
+    archi_service='api' so list_conversations and downstream tooling can
+    tell API-initiated chats apart from the web UI.
+    """
+    body = request.get_json(silent=True) or {}
+    message = (body.get('message') or '').strip()
+    if not message:
+        return jsonify({'error': 'invalid_request', 'detail': "'message' is required"}), 400
+
+    conversation_id = body.get('conversation_id')
+    if conversation_id is not None:
+        try:
+            conversation_id = int(conversation_id)
+        except (TypeError, ValueError):
+            return jsonify({'error': 'invalid_request',
+                            'detail': "'conversation_id' must be an integer"}), 400
+
+    config_name = body.get('config_name') or ''
+    try:
+        client_timeout = float(body.get('client_timeout', 60.0))
+    except (TypeError, ValueError):
+        client_timeout = 60.0
+    client_timeout = max(1.0, min(client_timeout, 300.0))
+
+    chat_wrapper = getattr(current_app, 'chat_wrapper', None)
+    if chat_wrapper is None:
+        return jsonify({'error': 'chat_unavailable',
+                        'detail': 'Chat service is not wired into this app.'}), 503
+
+    now = datetime.now(timezone.utc)
+    user_id = (session.get('user') or {}).get('id') or None
+
+    try:
+        output, returned_conv_id, message_ids, _timestamps, error_code = chat_wrapper(
+            message=[("User", message)],
+            conversation_id=conversation_id,
+            client_id=g.client_id,
+            is_refresh=False,
+            server_received_msg_ts=now,
+            client_sent_msg_ts=now.timestamp(),
+            client_timeout=client_timeout,
+            config_name=config_name,
+            user_id=user_id,
+        )
+    except Exception as exc:
+        logger.exception("POST /api/chat failed for client %s", g.client_id)
+        return jsonify({'error': 'chat_failed', 'detail': str(exc)}), 500
+
+    if error_code is not None:
+        return jsonify({'error': 'chat_error', 'code': error_code}), int(error_code)
+    if output is None or returned_conv_id is None:
+        return jsonify({'error': 'empty_result'}), 502
+
+    # Tag the conversation so list_conversations / audit log can tell
+    # API-originated chats apart from web-chat and Mattermost.
+    try:
+        _stamp_archi_service_api(returned_conv_id)
+    except Exception as exc:
+        # Don't fail the user request on a metadata fix-up — just log it.
+        logger.warning("Could not stamp archi_service='api' on conv %s: %s",
+                       returned_conv_id, exc)
+
+    answer = getattr(output, 'answer', None) or ''
+    return jsonify({
+        'answer': answer,
+        'conversation_id': returned_conv_id,
+        'archi_service': 'api',
+        'message_ids': list(message_ids) if message_ids else [],
+    }), 200
+
+
+def _stamp_archi_service_api(conversation_id: int) -> None:
+    """Set conversation_metadata.archi_service='api' if currently 'chat'."""
+    import psycopg2  # local import keeps the api module light at import time
+    chat_wrapper = getattr(current_app, 'chat_wrapper', None)
+    if chat_wrapper is None:
+        return
+    pg_config = getattr(chat_wrapper, 'pg_config', None)
+    if not pg_config:
+        return
+    conn = psycopg2.connect(**pg_config)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE conversation_metadata
+                SET archi_service = 'api'
+                WHERE conversation_id = %s
+                  AND (archi_service IS NULL OR archi_service = 'chat')
+                """,
+                (conversation_id,),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# MCP tool approvals (write/execute approval gate)
+# ---------------------------------------------------------------------------
+
+@api.route('/tool-approvals', methods=['GET'])
+@require_client_id
+def list_tool_approvals():
+    """Recent approval history for the calling user.
+
+    Query params:
+      ``limit``   max rows to return (clamped 1..500, default 100)
+      ``status``  optional filter: ``approved`` | ``denied`` | ``pending``
+                  | ``expired``
+      ``conversation_id`` optional filter
+
+    Powers the "Approval history" view in Settings > Permissions. Scoped
+    to the calling user — admin-style cross-user views would need an
+    explicit elevated role and are out of scope here.
+    """
+    try:
+        limit_raw = request.args.get('limit', '100')
+        try:
+            limit = int(limit_raw)
+        except (TypeError, ValueError):
+            limit = 100
+        status_filter = (request.args.get('status') or '').strip().lower() or None
+        if status_filter and status_filter not in (
+            'approved', 'denied', 'pending', 'expired'
+        ):
+            return jsonify({'error': 'invalid_status'}), 400
+
+        conv_raw = request.args.get('conversation_id')
+        conv_id = None
+        if conv_raw:
+            try:
+                conv_id = int(conv_raw)
+            except (TypeError, ValueError):
+                return jsonify({'error': 'invalid_conversation_id'}), 400
+
+        services = get_services()
+        rows = services.tool_approval_service.list_recent(
+            user_id=g.get('client_id') or None,
+            conversation_id=conv_id,
+            status=status_filter,
+            limit=limit,
+        )
+        return jsonify({'approvals': [_serialize_approval(r) for r in rows]}), 200
+    except Exception as exc:
+        logger.error("Error listing tool approvals: %s", exc)
+        return jsonify({'error': str(exc)}), 500
+
+
+@api.route('/tool-approvals/<approval_id>', methods=['GET'])
+@require_client_id
+def get_tool_approval(approval_id: str):
+    """Return the current state of a pending/decided tool-approval row."""
+    try:
+        services = get_services()
+        approval = services.tool_approval_service.get(approval_id)
+        if approval is None:
+            return jsonify({'error': 'not_found'}), 404
+        return jsonify(_serialize_approval(approval)), 200
+    except Exception as exc:
+        logger.error("Error reading tool approval %s: %s", approval_id, exc)
+        return jsonify({'error': str(exc)}), 500
+
+
+@api.route('/tool-approvals/<approval_id>', methods=['POST'])
+@require_client_id
+def decide_tool_approval(approval_id: str):
+    """Approve or deny a pending tool call.
+
+    Body: ``{"decision": "approve"|"deny"}``
+
+    Returns the updated row.  Rejects decisions on already-terminal or
+    expired approvals.
+    """
+    body = request.get_json(silent=True) or {}
+    raw = (body.get('decision') or '').strip().lower()
+    mapping = {'approve': 'approved', 'approved': 'approved',
+               'deny': 'denied', 'denied': 'denied'}
+    decision = mapping.get(raw)
+    if not decision:
+        return jsonify({
+            'error': 'invalid_decision',
+            'detail': "decision must be 'approve' or 'deny'",
+        }), 400
+
+    # Session schema set by _set_user_session() has 'username', not 'user_id'.
+    decided_by = (
+        (session.get('user') or {}).get('username')
+        or g.get('client_id')
+        or 'anonymous'
+    )
+    try:
+        services = get_services()
+        updated = services.tool_approval_service.decide(
+            approval_id,
+            decision=decision,
+            decided_by=decided_by,
+        )
+        if updated is None:
+            return jsonify({
+                'error': 'not_pending',
+                'detail': 'Approval is missing, already decided, or expired.',
+            }), 409
+        return jsonify(_serialize_approval(updated)), 200
+    except Exception as exc:
+        logger.error("Error deciding tool approval %s: %s", approval_id, exc)
+        return jsonify({'error': str(exc)}), 500
+
+
+def _serialize_approval(approval) -> dict:
+    return {
+        'approval_id': approval.approval_id,
+        'conversation_id': approval.conversation_id,
+        'message_id': approval.message_id,
+        'user_id': approval.user_id,
+        'server_name': approval.server_name,
+        'tool_name': approval.tool_name,
+        'tool_args': approval.tool_args,
+        'args_hash': approval.args_hash,
+        'sensitivity': approval.sensitivity,
+        'status': approval.status,
+        'requested_at': approval.requested_at.isoformat() if approval.requested_at else None,
+        'decided_at': approval.decided_at.isoformat() if approval.decided_at else None,
+        'decided_by': approval.decided_by,
+        'expires_at': approval.expires_at.isoformat() if approval.expires_at else None,
+        'source': approval.source,
+    }
+
+
+# User action audit log
+# ---------------------------------------------------------------------------
+
+
+def _record_user_action(
+    *,
+    user_id: Optional[str],
+    action_type: str,
+    target_kind: Optional[str] = None,
+    target_id: Optional[str] = None,
+    payload: Optional[dict] = None,
+    source: str = "api",
+) -> None:
+    """Fire-and-forget audit log helper.
+
+    Looks up the service from the request-bound factory; if anything goes
+    wrong, we log at WARNING level and return — the user-facing operation
+    must never fail because of an audit-write hiccup.
+    """
+    try:
+        services = get_services()
+    except Exception as exc:
+        logger.warning("UserAction: services unavailable, dropping %s: %s", action_type, exc)
+        return
+    svc = getattr(services, "user_action_service", None)
+    if svc is None:
+        return
+    try:
+        svc.record(
+            user_id=user_id, action_type=action_type, target_kind=target_kind,
+            target_id=target_id, payload=payload, source=source,
+        )
+    except Exception as exc:
+        logger.warning("UserAction: failed to record %s for %s: %s",
+                       action_type, user_id, exc)
+
+
+@api.route('/users/me/actions', methods=['GET'])
+@require_client_id
+def list_user_actions():
+    """List the current user's audited write actions, newest first.
+
+    Query params:
+        since:        ISO-8601 timestamp, returns only actions after it
+        limit:        max rows to return (1-1000, default 100)
+        action_type:  repeatable filter; if given, only matching action_types
+                      are returned (e.g. ``?action_type=api_key_set&action_type=api_key_removed``)
+    """
+    try:
+        services = get_services()
+        svc = getattr(services, "user_action_service", None)
+        if svc is None:
+            return jsonify({'actions': []}), 200
+
+        try:
+            limit = int(request.args.get('limit', 100))
+        except (TypeError, ValueError):
+            return jsonify({'error': 'invalid_request',
+                            'detail': "'limit' must be an integer"}), 400
+
+        since_param = request.args.get('since')
+        since = None
+        if since_param:
+            try:
+                since = datetime.fromisoformat(since_param.replace('Z', '+00:00'))
+            except ValueError:
+                return jsonify({'error': 'invalid_request',
+                                'detail': "'since' must be ISO-8601"}), 400
+
+        action_types = request.args.getlist('action_type') or None
+
+        actions = svc.list_for_user(
+            g.client_id, since=since, limit=limit, action_types=action_types,
+        )
+        return jsonify({
+            'actions': [
+                {
+                    'action_id': a.action_id,
+                    'action_type': a.action_type,
+                    'target_kind': a.target_kind,
+                    'target_id': a.target_id,
+                    'payload': a.payload,
+                    'source': a.source,
+                    'ts': a.ts.isoformat() if a.ts else None,
+                }
+                for a in actions
+            ],
+        }), 200
+    except Exception as exc:
+        logger.error("list_user_actions failed: %s", exc)
+        return jsonify({'error': str(exc)}), 500
+
+
 def register_api(app):
     """
     Register the API blueprint with a Flask app.
-    
+
     Usage:
         from src.interfaces.chat_app.api import register_api
         register_api(app)

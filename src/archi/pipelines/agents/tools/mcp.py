@@ -75,17 +75,23 @@ async def initialize_mcp_client(
     full_config = get_full_config()
 
     for name, server_cfg in mcp_servers.items():
-        # SSO-gated server: require a valid OAuth token before proceeding.  Read
-        # the flag from the raw server_cfg before stripping archi-only fields.
+        # SSO-gated server: skip when we have no valid token. At boot
+        # (user_id=None) the server is picked up later by the per-user
+        # _build_mcp_tools() call, which passes the chat user's user_id so
+        # the token is fetched from mcp_oauth_tokens. Registering without a
+        # token would 401 on the MCP initialize handshake.
         requires_sso = server_cfg.get('sso_auth', False)
-        if requires_sso:
-            access_token = _mcp_oauth.get_access_token(user_id, name) if user_id else None
-            if not access_token:
-                logger.info(
-                    f"Skipping MCP server '{name}': sso_auth=true but no valid "
-                    f"token for user_id={user_id!r}"
-                )
-                continue
+        access_token = (
+            _mcp_oauth.get_access_token(user_id, name)
+            if requires_sso and user_id
+            else None
+        )
+        if requires_sso and not access_token:
+            logger.info(
+                f"Skipping MCP server '{name}': sso_auth=true but no valid "
+                f"token for user_id={user_id!r}"
+            )
+            continue
 
         # Load any declared skill so we can append it to the agent system prompt.
         skill_name = server_cfg.get("skill")
@@ -129,6 +135,12 @@ async def initialize_mcp_client(
             for tool in tools:
                 # Return error messages to the LLM instead of crashing the agent chain.
                 tool.handle_tool_error = True
+                # Tag with originating MCP server so downstream guardrails can
+                # look up per-server policy from mcp_servers_config.
+                try:
+                    tool._archi_server_name = name  # type: ignore[attr-defined]
+                except Exception:
+                    pass
                 logger.info(f"Loaded tool from MCP server '{name}': {tool.name} - {tool.description}")
             all_tools.extend(tools)
         except Exception as e:

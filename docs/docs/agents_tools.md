@@ -144,6 +144,24 @@ Semantic and keyword (BM25) hybrid retrieval of relevant passages from the vecto
 
 Enables Model Context Protocol (MCP) tools from external servers. See [MCP Integration](#mcp-integration) below.
 
+### `web_search`
+
+Runs a live web search and returns the top results as a short text block (title,
+URL, snippet). Backed by [Tavily](https://tavily.com/) when the
+`TAVILY_API_KEY` secret is set, otherwise falls back to DuckDuckGo (no key
+required).
+
+- **Input**: a plain-text query string (about 3-12 keywords).
+- **Returns**: a numbered list of results suitable for direct inclusion in a
+  reply.
+- **Use for**: current events, package versions, vendor docs, or any
+  information not in archi's indexed corpus.
+- **Provider override**: set `services.chat_app.web_search.provider` in the
+  deployment config to `"tavily"`, `"duckduckgo"`, or `"auto"`.
+- **Result count**: tune via `services.chat_app.web_search.max_results`
+  (default 5).
+- **Safety**: read-only; classified `safe` for tool-approval gates.
+
 ---
 
 ## Agent Management in the Chat UI

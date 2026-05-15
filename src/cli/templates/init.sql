@@ -594,6 +594,44 @@ CREATE INDEX IF NOT EXISTS idx_tool_calls_conv ON agent_tool_calls(conversation_
 CREATE INDEX IF NOT EXISTS idx_tool_calls_tool ON agent_tool_calls(tool_name);
 
 -- ============================================================================
+-- 7.1 MCP TOOL APPROVALS (Claude-style write/execute gate)
+-- ============================================================================
+-- Records each (conversation, tool, args) trigger of the MCP guardrail flow.
+-- Lifecycle: pending → approved | denied | expired.
+
+CREATE TABLE IF NOT EXISTS tool_approvals (
+    approval_id     VARCHAR(64) PRIMARY KEY,
+    conversation_id INTEGER,
+    message_id      INTEGER,
+    user_id         VARCHAR(200),
+    server_name     VARCHAR(200) NOT NULL,
+    tool_name       VARCHAR(200) NOT NULL,
+    tool_args       JSONB NOT NULL DEFAULT '{}'::jsonb,
+    args_hash       VARCHAR(64) NOT NULL,
+    sensitivity     VARCHAR(20) NOT NULL DEFAULT 'write',
+    status          VARCHAR(20) NOT NULL DEFAULT 'pending',
+    requested_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    decided_at      TIMESTAMPTZ,
+    decided_by      VARCHAR(200),
+    expires_at      TIMESTAMPTZ NOT NULL,
+    source          VARCHAR(20) NOT NULL DEFAULT 'chat',
+    consumed_at     TIMESTAMPTZ
+);
+
+-- Idempotent migration for volumes that pre-date the consumed_at column.
+ALTER TABLE tool_approvals ADD COLUMN IF NOT EXISTS consumed_at TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS idx_tool_approvals_lookup
+    ON tool_approvals (conversation_id, tool_name, args_hash, status);
+CREATE INDEX IF NOT EXISTS idx_tool_approvals_status_expires
+    ON tool_approvals (status, expires_at);
+-- Partial index powering the consume-on-next-turn lookup; only approved-and-
+-- unconsumed rows are eligible, so the index stays tiny.
+CREATE INDEX IF NOT EXISTS idx_tool_approvals_unconsumed
+    ON tool_approvals (conversation_id, tool_name)
+    WHERE status = 'approved' AND consumed_at IS NULL;
+
+-- ============================================================================
 -- 8. A/B COMPARISON TRACKING
 -- ============================================================================
 
@@ -671,6 +709,28 @@ CREATE TABLE IF NOT EXISTS ab_variant_metrics (
     total_comparisons INTEGER NOT NULL DEFAULT 0,
     last_updated TIMESTAMP NOT NULL DEFAULT NOW()
 );
+
+-- ============================================================================
+-- 8.1 USER ACTIONS (write-operation audit timeline)
+-- ============================================================================
+-- Single source of truth for "what has been done for/by a user" — settings
+-- changes, API-key edits, document uploads, tool approvals, agent edits.
+
+CREATE TABLE IF NOT EXISTS user_actions (
+    action_id   VARCHAR(64) PRIMARY KEY,
+    user_id     VARCHAR(200),
+    action_type VARCHAR(100) NOT NULL,
+    target_kind VARCHAR(100),
+    target_id   VARCHAR(200),
+    payload     JSONB NOT NULL DEFAULT '{}'::jsonb,
+    source      VARCHAR(20) NOT NULL DEFAULT 'web',
+    ts          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_actions_user_ts
+    ON user_actions (user_id, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_user_actions_type_ts
+    ON user_actions (action_type, ts DESC);
 
 -- ============================================================================
 -- 9. MIGRATION STATE (for resumable migrations)
