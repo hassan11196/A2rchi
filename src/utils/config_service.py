@@ -219,8 +219,8 @@ class ConfigService:
                     ADD COLUMN IF NOT EXISTS services_config JSONB DEFAULT '{}'::jsonb,
                     ADD COLUMN IF NOT EXISTS data_manager_config JSONB DEFAULT '{}'::jsonb,
                     ADD COLUMN IF NOT EXISTS archi_config JSONB DEFAULT '{}'::jsonb,
-                    ADD COLUMN IF NOT EXISTS global_config JSONB DEFAULT '{}'::jsonb,
-                    ADD COLUMN IF NOT EXISTS mcp_servers_config JSONB DEFAULT '{}'::jsonb
+                    ADD COLUMN IF NOT EXISTS mcp_servers_config JSONB DEFAULT '{}'::jsonb,
+                    ADD COLUMN IF NOT EXISTS global_config JSONB DEFAULT '{}'::jsonb
                     """
                 )
                 cursor.execute(
@@ -270,6 +270,46 @@ class ConfigService:
                         created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                         updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                         PRIMARY KEY (user_id, server_name)
+                    )
+                    """
+                )
+                # Server-side MCP tables (bearer tokens for /mcp/sse, OAuth2 PKCE
+                # codes, and RFC 7591 dynamic client registrations). Mirrors
+                # init.sql so pre-existing deployments get them on upgrade.
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS mcp_tokens (
+                        token        VARCHAR(64) PRIMARY KEY,
+                        user_id      VARCHAR(200) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        display_name TEXT,
+                        created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        last_used_at TIMESTAMPTZ,
+                        expires_at   TIMESTAMPTZ
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS mcp_auth_codes (
+                        code                  VARCHAR(64) PRIMARY KEY,
+                        user_id               VARCHAR(200) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        code_challenge        VARCHAR(128) NOT NULL,
+                        code_challenge_method VARCHAR(10) NOT NULL DEFAULT 'S256',
+                        redirect_uri          TEXT NOT NULL,
+                        client_id             VARCHAR(100) NOT NULL,
+                        created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        expires_at            TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '10 minutes',
+                        used                  BOOLEAN NOT NULL DEFAULT FALSE
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS mcp_registered_clients (
+                        client_id     VARCHAR(32) PRIMARY KEY,
+                        client_name   TEXT,
+                        redirect_uris TEXT[] NOT NULL,
+                        created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     )
                     """
                 )
