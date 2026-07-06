@@ -148,7 +148,8 @@ CREATE TABLE IF NOT EXISTS mcp_oauth_tokens (
     PRIMARY KEY (user_id, server_name)
 );
 
--- 1.2 MCP API TOKENS (VS Code / Cursor integration)
+-- ============================================================================
+-- 1.4 MCP API TOKENS (VS Code / Cursor integration)
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS mcp_tokens (
@@ -178,7 +179,9 @@ CREATE TABLE IF NOT EXISTS mcp_auth_codes (
 CREATE INDEX IF NOT EXISTS idx_mcp_auth_codes_expires ON mcp_auth_codes(expires_at);
 
 -- OAuth2 dynamic client registrations (RFC 7591) used by MCP clients.
-CREATE TABLE IF NOT EXISTS mcp_oauth_clients (
+-- NOTE: distinct from mcp_oauth_clients above, which stores *our* client
+-- registrations against external sso_auth MCP servers.
+CREATE TABLE IF NOT EXISTS mcp_registered_clients (
     client_id VARCHAR(32) PRIMARY KEY,    -- secrets.token_hex(16)
     client_name TEXT,
     redirect_uris TEXT[] NOT NULL,
